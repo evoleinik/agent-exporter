@@ -32,13 +32,23 @@ CLAUDE_PATHS = ("/claude/versions/", "/ccd-cli/")
 # Environment keys that agents set in every process they start. An orphaned child keeps them.
 AGENT_ENV_MARKERS = ("CLAUDECODE", "AI_AGENT", "PI_CODING_AGENT", "CODEX_SANDBOX",
                      "CODEX_SANDBOX_NETWORK_DISABLED", "GEMINI_CLI")
-STATES = ("working", "waiting", "idle")
-WAITING_NOTIFICATIONS = {"permission_prompt", "elicitation_dialog", "elicitation_url_dialog",
-                         "agent_needs_input"}
-HOOK_EVENTS = ("SessionStart", "UserPromptSubmit", "PostToolUse", "Notification", "Stop",
-               "StopFailure", "SessionEnd")
+STATES = ("working", "waiting", "idle")  # what a hook file records
+# What a session is, from the person's side. Every session is in exactly one.
+STATUSES = ("working", "needs_you", "your_turn", "stale")
+REASONS = ("permission", "question", "plan", "input", "form")
+NOTIFICATION_REASONS = {"permission_prompt": "permission", "agent_needs_input": "input",
+                        "elicitation_dialog": "form", "elicitation_url_dialog": "form"}
+# Claude Code hook events to install, with the matcher each needs (None = every occurrence).
+HOOK_EVENTS = {
+    "SessionStart": None, "UserPromptSubmit": None,
+    "PreToolUse": "AskUserQuestion|ExitPlanMode",  # these two tools wait on the person
+    "PermissionRequest": None, "PostToolUse": None, "PostToolUseFailure": None,
+    "Notification": None, "Stop": None, "StopFailure": None, "SessionEnd": None,
+}
 HOOK_MARK = re.compile(r"agent[-_]exporter(\.py)?['\"]? hook\b")
 SESSION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
+WORKING_TIMEOUT = 1800  # a "working" session with no sign of life this long was interrupted
+RECENT = 60  # seconds; activity this fresh means a session without hooks is working
 MAX_WAITING_SERIES = 5  # one series per waiting session; Beszel keeps 64 series per machine
 TRANSCRIPT_RETRY = 600  # seconds before searching again for a transcript that was not found
 MIN_SAMPLE = 5.0  # seconds; a shorter gap between runs turns tick rounding into fake CPU rates
@@ -357,67 +367,103 @@ def snapshot(args, now: float, prev: dict) -> tuple[dict, dict]:
             activity[pid] = mtime
     cache = {k: v for k, v in cache.items() if k in live_sids}
 
-    sessions = {s: 0 for s in STATES}
-    waiting_longest = 0.0
-    waiting_list = []
-    hook_files = read_hook_sessions(os.path.join(args.runtime_dir, "sessions"))
+    # Hook files, joined to the live process that wrote them (or that owns their session id).
+    hooks: dict[int, dict] = {}
     stale_hook_files = []
-    for h in hook_files:
+    for h in read_hook_sessions(os.path.join(args.runtime_dir, "sessions")):
         pid = h.get("pid")
-        live = (isinstance(pid, int) and pid in procs and procs[pid].agent == "claude"
-                and procs[pid].start_ticks == h.get("start")) or h.get("session_id") in live_sids
-        if not live:
+        if isinstance(pid, int) and pid in procs and procs[pid].agent and procs[pid].start_ticks == h.get("start"):
+            owner = pid
+        else:
+            owner = live_sids.get(h.get("session_id"))
+        if owner is None:
             stale_hook_files.append(h["_file"])
             continue
-        owner = pid if isinstance(pid, int) and pid in procs else live_sids.get(h.get("session_id"))
-        if owner is not None:
-            activity[owner] = max(activity.get(owner, 0.0), h["ts"])
-        sessions[h["state"]] += 1
-        if h["state"] == "waiting":
-            waiting_longest = max(waiting_longest, now - h["ts"])
-            name = h.get("name")
-            if not name and owner is not None:  # hook files written before names existed
-                try:
-                    name = session_name(os.readlink(os.path.join(args.proc, str(owner), "cwd")), h["session_id"])
-                except OSError:
-                    pass
-            waiting_list.append({"name": name or session_name(None, h["session_id"]),
-                                 "seconds": round(now - h["ts"]), "session_id": h["session_id"]})
+        if owner not in hooks or h["ts"] > hooks[owner]["ts"]:  # after /clear, keep the newest
+            hooks[owner] = h
 
     # A process whose parent is the same agent is part of that agent (codex's node wrapper and
-    # native binary, for example). Count the topmost one; add the rest to its memory.
+    # native binary, for example). One session per topmost process; the rest add memory.
+    def root_of(p: Proc) -> Proc:
+        while procs.get(p.ppid) is not None and procs[p.ppid].agent == p.agent:
+            p = procs[p.ppid]
+        return p
+
+    kids: dict[int, list[int]] = {}
+    for p in procs.values():
+        kids.setdefault(p.ppid, []).append(p.pid)
+
     group_rss: dict[int, int] = {}
     group_active: dict[int, float] = {}
     for p in procs.values():
         if not p.agent:
             continue
-        root = p
-        while procs.get(root.ppid) is not None and procs[root.ppid].agent == p.agent:
-            root = procs[root.ppid]
+        root = root_of(p)
         group_rss[root.pid] = group_rss.get(root.pid, 0) + p.rss
         if p.last_active:
             group_active[root.pid] = max(group_active.get(root.pid, 0.0), p.last_active)
+        if p.pid != root.pid and p.pid in hooks and root.pid not in hooks:
+            hooks[root.pid] = hooks.pop(p.pid)
+
+    def tool_running(root: Proc, since: float) -> bool:
+        """A tool started after `since` (the session's last hook event) is still running under it: a
+        Claude Bash tool shell, or a busy child. Background shells started earlier do not count."""
+        stack, seen = list(kids.get(root.pid, [])), 0
+        while stack and seen < 2000:
+            q = procs.get(stack.pop())
+            seen += 1
+            if q is None or q.agent == root.agent:
+                continue
+            if q.start >= since - 2 and (any("/shell-snapshots/" in a for a in q.argv[:3]) or q.last_active == now):
+                return True
+            stack.extend(kids.get(q.pid, []))
+        return False
 
     agents = {name: {"processes": 0, "memory_bytes": 0, "stale": 0, "stale_memory_bytes": 0}
               for name in args.agents}
-    stale = []
+    status = {k: 0 for k in STATUSES}
+    needs_you, stale, sessions_out = [], [], []
     for pid, rss in group_rss.items():
         p = procs[pid]
         a = agents.setdefault(p.agent, {"processes": 0, "memory_bytes": 0, "stale": 0,
                                         "stale_memory_bytes": 0})
         a["processes"] += 1
         a["memory_bytes"] += rss
-        # A Claude session's transcript date and hooks are exact. Its CPU is not: every session
-        # wakes up together when settings.json changes, so CPU counts only without them.
-        exact = activity.get(pid)
-        evidence = [exact] if exact else [t for t in (group_active.get(pid),) if t]
-        last = max(evidence) if evidence else p.first_seen
+        h = hooks.get(pid)
+        # Transcript dates and hook events are exact. CPU is not: every Claude session wakes up at
+        # once when settings.json changes, so CPU counts only when nothing exact exists.
+        exact = max([t for t in (activity.get(pid), h["ts"] if h else None) if t], default=None)
+        last = exact or group_active.get(pid) or p.first_seen
         idle = now - last
         if idle >= args.stale_after:
+            st = "stale"
+        elif h and h["state"] == "waiting":
+            st = "needs_you"
+        elif h and h["state"] == "working":
+            st = "working" if idle < args.working_timeout or tool_running(p, h["ts"]) else "your_turn"
+        elif h:
+            st = "your_turn"
+        else:
+            # Without hooks, working needs fresh activity; first sighting and old background
+            # shells are not proof.
+            seen = [t for t in (exact, group_active.get(pid)) if t]
+            st = "working" if any(now - t < RECENT for t in seen) else "your_turn"
+        status[st] += 1
+        try:
+            cwd = os.readlink(os.path.join(args.proc, str(pid), "cwd"))
+        except OSError:
+            cwd = ""
+        name = (h or {}).get("name") or session_name(cwd, sids.get(pid) or str(pid))
+        sessions_out.append({"pid": pid, "agent": p.agent, "status": st, "name": name,
+                             "idle_seconds": round(idle), "memory_bytes": rss})
+        if st == "needs_you":
+            needs_you.append({"name": name, "reason": h.get("reason") or "input", "agent": p.agent,
+                              "seconds": round(now - h["ts"]), "session_id": h.get("session_id")})
+        elif st == "stale":
             a["stale"] += 1
             a["stale_memory_bytes"] += rss
             stale.append({"pid": pid, "agent": p.agent, "idle_seconds": round(idle),
-                          "memory_bytes": rss, "session_id": sids.get(pid)})
+                          "memory_bytes": rss, "session_id": sids.get(pid), "name": name})
 
     agent_pids = {p.pid for p in procs.values() if p.agent}
 
@@ -445,8 +491,9 @@ def snapshot(args, now: float, prev: dict) -> tuple[dict, dict]:
     snap = {
         "time": round(now, 3),
         "agents": agents,
-        "sessions": dict(sessions, waiting_longest_seconds=round(waiting_longest)),
-        "waiting": sorted(waiting_list, key=lambda w: -w["seconds"]),
+        "status": status,
+        "needs_you": sorted(needs_you, key=lambda w: -w["seconds"]),
+        "sessions": sorted(sessions_out, key=lambda x: (STATUSES.index(x["status"]), x["idle_seconds"])),
         "stale": sorted(stale, key=lambda s: -s["idle_seconds"]),
         "runaway": runaway,
         "ollama": ollama_stats(args.ollama_url, args.timeout),
@@ -474,25 +521,23 @@ def render_prom(snap: dict) -> str:
            [({"agent": n}, a["processes"]) for n, a in agents.items()])
     family("agent_memory_bytes", "Resident memory of agent processes, by agent.",
            [({"agent": n}, a["memory_bytes"]) for n, a in agents.items()])
-    family("agent_stale_processes", "Agent processes with no activity for the stale period.",
-           [({"agent": n}, a["stale"]) for n, a in agents.items()])
-    family("agent_stale_memory_bytes", "Resident memory held by stale agent processes.",
+    family("agent_stale_memory_bytes", "Resident memory held by stale agent sessions.",
            [({}, sum(a["stale_memory_bytes"] for a in agents.values()))])
-    s = snap["sessions"]
-    family("agent_sessions", "Claude Code sessions by state, from hooks. Waiting means it needs you.",
-           [({"state": st}, s[st]) for st in STATES])
-    family("agent_waiting_longest_seconds", "How long the longest-waiting session has waited.",
-           [({}, s["waiting_longest_seconds"])])
+    family("agent_sessions", "Agent sessions by status: working, needs you, your turn, stale. "
+           "Each session is in exactly one.",
+           [({"status": st}, snap["status"][st]) for st in STATUSES])
+    family("agent_needs_you_longest_seconds", "How long the longest-waiting session has needed you.",
+           [({}, snap["needs_you"][0]["seconds"] if snap["needs_you"] else 0)])
     shown, used = [], set()
-    for w in snap["waiting"][:MAX_WAITING_SERIES]:
+    for w in snap["needs_you"][:MAX_WAITING_SERIES]:
         name, n = w["name"], 2
         while name in used:
             name, n = f"{w['name']}-{n}", n + 1
         used.add(name)
-        shown.append(({"session": name}, w["seconds"]))
+        shown.append(({"reason": w["reason"], "session": name}, w["seconds"]))
     if shown:
-        family("agent_waiting_session_seconds",
-               "Seconds each waiting session has waited, named by its folder. At most 5.", shown)
+        family("agent_needs_you_session_seconds",
+               "Seconds each session has needed you, by reason and folder name. At most 5.", shown)
     family("agent_runaway_processes",
            "Processes started by agents that kept a CPU core busy past the runaway period.",
            [({}, len(snap["runaway"]))])
@@ -534,13 +579,11 @@ def render_text(snap: dict) -> str:
     for name, a in snap["agents"].items():
         out.append(f"{name:<8} {a['processes']:>4} procs  {human_bytes(a['memory_bytes']):>9}"
                    f"  {a['stale']} stale ({human_bytes(a['stale_memory_bytes'])})")
-    s = snap["sessions"]
-    waiting = f"waiting {s['waiting']}"
-    if s["waiting"]:
-        waiting += f" (longest {human_secs(s['waiting_longest_seconds'])})"
-    out.append(f"sessions working {s['working']}  {waiting}  idle {s['idle']}  (from hooks)")
-    for w in snap["waiting"]:
-        out.append(f"waiting  {w['name']}  {human_secs(w['seconds'])}")
+    st = snap["status"]
+    out.append(f"status   working {st['working']}  needs you {st['needs_you']}  "
+               f"your turn {st['your_turn']}  stale {st['stale']}")
+    for w in snap["needs_you"]:
+        out.append(f"needs    {w['name']}  {w['reason']}  {human_secs(w['seconds'])}")
     if snap["runaway"]:
         for r in snap["runaway"]:
             out.append(f"runaway  pid {r['pid']} busy {human_secs(r['busy_seconds'])}  {r['cmd']}")
@@ -610,22 +653,29 @@ def cmd_show(args) -> int:
     return 0
 
 
-def hook_state(event: str, payload: dict) -> str | None:
-    if event in ("UserPromptSubmit", "PostToolUse"):
-        return "working"
+def hook_state(event: str, payload: dict) -> tuple[str, str | None] | None:
+    """Map a Claude Code hook event to (state, reason). None leaves the state as it was."""
+    if event in ("UserPromptSubmit", "PostToolUse", "PostToolUseFailure"):
+        return "working", None
+    if event == "PreToolUse":
+        tool = payload.get("tool_name")
+        return {"AskUserQuestion": ("waiting", "question"), "ExitPlanMode": ("waiting", "plan")}.get(tool)
+    if event == "PermissionRequest":
+        return "waiting", "permission"
     if event in ("SessionStart", "Stop", "StopFailure"):
-        return "idle"
+        return "idle", None
     if event == "Notification":
         kind = payload.get("notification_type")
-        if kind in WAITING_NOTIFICATIONS:
-            return "waiting"
-        return "idle" if kind == "idle_prompt" else None
+        if kind in NOTIFICATION_REASONS:
+            return "waiting", NOTIFICATION_REASONS[kind]
+        return ("idle", None) if kind == "idle_prompt" else None
     if event == "SessionEnd":
-        return "ended"
+        return "ended", None
     return None
 
 
-def find_claude_ancestor(proc: str, start_pid: int) -> tuple[int, int] | None:
+def find_agent_ancestor(proc: str, start_pid: int) -> tuple[int, int] | None:
+    """The nearest ancestor that is a coding agent: (pid, start ticks)."""
     pid, hops = start_pid, 0
     while pid > 1 and hops < 16:
         d = os.path.join(proc, str(pid))
@@ -641,7 +691,7 @@ def find_claude_ancestor(proc: str, start_pid: int) -> tuple[int, int] | None:
         except OSError:
             return None
         fields = stat[stat.rfind(")") + 2:].split()
-        if agent_name(argv, exe) == "claude":
+        if agent_name(argv, exe):
             return pid, int(fields[19])
         pid, hops = int(fields[1]), hops + 1
     return None
@@ -652,9 +702,10 @@ def record_hook(payload: dict, sessions_dir: str, proc: str, now: float, parent_
     event = payload.get("hook_event_name")
     if not isinstance(sid, str) or not SESSION_ID.fullmatch(sid) or not isinstance(event, str):
         return
-    state = hook_state(event, payload)
-    if state is None:
+    mapped = hook_state(event, payload)
+    if mapped is None:
         return
+    state, reason = mapped
     os.makedirs(sessions_dir, exist_ok=True)
     path = os.path.join(sessions_dir, sid + ".json")
     with open(os.path.join(sessions_dir, ".lock"), "w") as lock:
@@ -668,8 +719,9 @@ def record_hook(payload: dict, sessions_dir: str, proc: str, now: float, parent_
             except OSError:
                 pass
             return
-        owner = find_claude_ancestor(proc, parent_pid)
-        record = {"session_id": sid, "state": state, "ts": now, "event": event,
+        owner = find_agent_ancestor(proc, parent_pid)
+        record = {"session_id": sid, "state": state, "ts": now, "event": event, "reason": reason,
+                  "notification_type": payload.get("notification_type"),
                   "name": session_name(payload.get("cwd"), sid) if payload.get("cwd")
                   else (old or {}).get("name") or session_name(None, sid)}
         if owner:
@@ -715,15 +767,17 @@ def edit_settings(path: str, install: bool, command: str, dry_run: bool) -> dict
         data = {}
     hooks = data.setdefault("hooks", {}) if install else data.get("hooks") or {}
     changed, unchanged = [], []
-    for event in HOOK_EVENTS:
+    for event, matcher in HOOK_EVENTS.items():
         groups = hooks.get(event) or []
         ours = any(is_ours(h) for g in groups if isinstance(g, dict) for h in g.get("hooks") or [])
         if install:
             if ours:
                 unchanged.append(event)
                 continue
-            groups.append({"hooks": [{"type": "command", "command": command, "async": True,
-                                      "timeout": 10}]})
+            group = {"hooks": [{"type": "command", "command": command, "async": True, "timeout": 10}]}
+            if matcher:
+                group = {"matcher": matcher, **group}
+            groups.append(group)
             hooks[event] = groups
             changed.append(event)
         else:
@@ -786,6 +840,8 @@ def build_parser() -> argparse.ArgumentParser:
                          help="agents always reported, even at zero (default: %(default)s)")
     collect.add_argument("--stale-after", type=parse_duration, default=parse_duration("24h"),
                          help="idle time after which an agent process counts as stale (default: 24h)")
+    collect.add_argument("--working-timeout", type=parse_duration, default=float(WORKING_TIMEOUT),
+                         help="a working session silent this long counts as your turn (default: 30m)")
     collect.add_argument("--runaway-after", type=parse_duration, default=parse_duration("1h"),
                          help="busy time after which an agent's child counts as runaway (default: 1h)")
     collect.add_argument("--runaway-cpu", type=float, default=0.9,

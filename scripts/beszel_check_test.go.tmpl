@@ -32,7 +32,7 @@ func TestAgentExporterFile(t *testing.T) {
 	}
 	waiting := 0
 	for k := range vals {
-		if strings.HasPrefix(k, "agent_waiting_session_seconds_") {
+		if strings.HasPrefix(k, "agent_needs_you_session_seconds_") {
 			waiting++
 			if meta[k].Unit != "seconds" {
 				t.Errorf("%s unit is %q, want seconds", k, meta[k].Unit)
@@ -44,13 +44,18 @@ func TestAgentExporterFile(t *testing.T) {
 		}
 	}
 	// BeszelBar reads the session name from this exact key shape.
-	if v, ok := vals["agent_waiting_session_seconds_beszel_check"]; !ok || v != 2700 {
-		t.Errorf("want agent_waiting_session_seconds_beszel_check = 2700, got %v (present %v, %d waiting keys)", v, ok, waiting)
+	if v, ok := vals["agent_needs_you_session_seconds_question_beszel_check"]; !ok || v != 2700 {
+		t.Errorf("want agent_needs_you_session_seconds_question_beszel_check = 2700, got %v (present %v, %d keys)", v, ok, waiting)
+	}
+	for _, st := range []string{"working", "needs_you", "your_turn", "stale"} {
+		if _, ok := vals["agent_sessions_"+st]; !ok {
+			t.Errorf("missing agent_sessions_%s", st)
+		}
 	}
 	if meta["agent_memory_bytes_claude"].Unit != "bytes" {
 		t.Errorf("memory unit is %q, want bytes", meta["agent_memory_bytes_claude"].Unit)
 	}
-	if meta["agent_waiting_longest_seconds"].Unit != "seconds" {
-		t.Errorf("wait unit is %q, want seconds", meta["agent_waiting_longest_seconds"].Unit)
+	if meta["agent_needs_you_longest_seconds"].Unit != "seconds" {
+		t.Errorf("wait unit is %q, want seconds", meta["agent_needs_you_longest_seconds"].Unit)
 	}
 }

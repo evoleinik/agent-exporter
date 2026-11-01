@@ -11,13 +11,12 @@ metrics:
         agent_processes_codex: Codex
         agent_memory_bytes_claude: Claude Code
         agent_memory_bytes_codex: Codex
-        agent_stale_processes_claude: Claude Code
-        agent_stale_processes_codex: Codex
-        agent_stale_memory_bytes: Held by stale agents
+        agent_stale_memory_bytes: Held by stale sessions
         agent_sessions_working: Working
-        agent_sessions_waiting: Waiting for you
-        agent_sessions_idle: Idle
-        agent_waiting_longest_seconds: Longest wait
+        agent_sessions_needs_you: Needs you
+        agent_sessions_your_turn: Your turn
+        agent_sessions_stale: Stale
+        agent_needs_you_longest_seconds: Longest wait for you
         agent_runaway_processes: Runaway processes
         agent_runaway_longest_seconds: Longest runaway
         ollama_up: ollama up

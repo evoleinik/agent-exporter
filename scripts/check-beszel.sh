@@ -21,7 +21,8 @@ import agent_exporter as ae
 work = sys.argv[2]
 args = ae.build_parser().parse_args(["collect", "--runtime-dir", os.path.join(work, "rt")])
 snap, _ = ae.snapshot(args, time.time(), {})
-snap["waiting"] = [{"name": "beszel-check", "seconds": 2700, "session_id": "check"}] + snap["waiting"]
+snap["needs_you"] = [{"name": "beszel-check", "reason": "question", "seconds": 2700, "agent": "claude",
+                      "session_id": "check"}] + snap["needs_you"]
 ae.write_atomic(os.path.join(work, "prom", "agents.prom"), ae.render_prom(snap))
 PY
 mkdir -p "$work/data"

@@ -64,6 +64,7 @@ def make_args(tmp_path, **kw):
         proc=str(tmp_path / "proc"), runtime_dir=str(tmp_path / "rt"),
         claude_dir=str(tmp_path / "claude"), all_users=False, agents=("claude", "codex"),
         stale_after=86400.0, runaway_after=3600.0, runaway_cpu=0.9, active_cpu=0.05,
+        working_timeout=1800.0,
         ollama_url="", timeout=1.0, out=str(tmp_path / "out" / "agents.prom"), json=False)
     for k, v in kw.items():
         setattr(args, k, v)
@@ -220,12 +221,12 @@ def test_hook_states_and_waiting_time(tmp_path):
     rec = json.load(open(tmp_path / "rt" / "sessions" / "s1.json"))
     assert (rec["state"], rec["pid"], rec["start"]) == ("waiting", 10, start)
     snap, _ = ae.snapshot(make_args(tmp_path), NOW, {})
-    assert snap["sessions"]["waiting"] == 1
-    assert snap["sessions"]["waiting_longest_seconds"] == 90
+    assert snap["status"]["needs_you"] == 1
+    assert [(w["reason"], w["seconds"]) for w in snap["needs_you"]] == [("permission", 90)]
     hook(tmp_path, {"session_id": "s1", "hook_event_name": "PostToolUse"}, NOW - 80)
     hook(tmp_path, {"session_id": "s1", "hook_event_name": "Stop"}, NOW - 70)
     snap, _ = ae.snapshot(make_args(tmp_path), NOW, {})
-    assert (snap["sessions"]["idle"], snap["sessions"]["waiting"]) == (1, 0)
+    assert (snap["status"]["your_turn"], snap["status"]["needs_you"]) == (1, 0)
     hook(tmp_path, {"session_id": "s1", "hook_event_name": "SessionEnd"}, NOW - 60)
     assert not (tmp_path / "rt" / "sessions" / "s1.json").exists()
 
@@ -241,7 +242,7 @@ def test_dead_session_not_counted(tmp_path):
     FakeProc(tmp_path / "proc")  # no claude process alive
     hook(tmp_path, {"session_id": "gone", "hook_event_name": "UserPromptSubmit"}, NOW - 10)
     snap, _ = ae.snapshot(make_args(tmp_path), NOW, {})
-    assert snap["sessions"]["working"] == 0
+    assert snap["status"] == {"working": 0, "needs_you": 0, "your_turn": 0, "stale": 0}
     assert snap["_stale_hook_files"]
 
 
@@ -492,40 +493,43 @@ def test_session_name(cwd, want):
     assert ae.session_name(cwd, "abcdef1234") == want
 
 
-def test_waiting_sessions_become_named_series(tmp_path):
+def test_needs_you_sessions_become_named_series(tmp_path):
     fp = FakeProc(tmp_path / "proc")
-    fp.add(10, [CCD], exe=CCD)
-    fp.add(999, ["sh"], ppid=10)
     for i in range(7):
-        cwd = "/w/mail-reports-071777" if i < 2 else f"/w/task-{i}"
-        hook(tmp_path, {"session_id": f"s{i}", "hook_event_name": "Notification", "cwd": cwd,
-                        "notification_type": "permission_prompt"}, NOW - 100 * (i + 1))
+        pid = 10 + i
+        fp.add(pid, [CCD], exe=CCD)
+        fp.add(900 + i, ["sh"], ppid=pid)
+        cwd = f"/w/task-{i}"
+        ae.record_hook({"session_id": f"s{i}", "hook_event_name": "Notification", "cwd": cwd,
+                        "notification_type": "permission_prompt"},
+                       str(tmp_path / "rt" / "sessions"), str(tmp_path / "proc"), NOW - 100 * (i + 1), 900 + i)
     snap, _ = ae.snapshot(make_args(tmp_path), NOW, {})
-    assert snap["sessions"]["waiting"] == 7
-    assert [w["name"] for w in snap["waiting"]][:2] == ["task-6", "task-5"]
+    assert snap["status"]["needs_you"] == 7
+    assert [w["name"] for w in snap["needs_you"]][:2] == ["task-6", "task-5"]
     text = ae.render_prom(snap)
-    lines = [l for l in text.splitlines() if l.startswith("agent_waiting_session_seconds{")]
+    lines = [l for l in text.splitlines() if l.startswith("agent_needs_you_session_seconds{")]
     assert len(lines) == ae.MAX_WAITING_SERIES
-    assert 'agent_waiting_session_seconds{session="task-6"} 700' in lines
+    assert 'agent_needs_you_session_seconds{reason="permission",session="task-6"} 700' in lines
     _, series = parse_prom(text)
     assert len(series) == len(set(series))
 
 
-def test_same_folder_waiting_twice_gets_distinct_series(tmp_path):
+def test_same_folder_needing_you_twice_gets_distinct_series(tmp_path):
     fp = FakeProc(tmp_path / "proc")
-    fp.add(10, [CCD], exe=CCD)
-    fp.add(999, ["sh"], ppid=10)
     for i in range(2):
-        hook(tmp_path, {"session_id": f"d{i}", "hook_event_name": "Notification", "cwd": "/w/same",
-                        "notification_type": "permission_prompt"}, NOW - 10 * (i + 1))
+        fp.add(10 + i, [CCD], exe=CCD)
+        fp.add(900 + i, ["sh"], ppid=10 + i)
+        ae.record_hook({"session_id": f"d{i}", "hook_event_name": "Notification", "cwd": "/w/same",
+                        "notification_type": "agent_needs_input"},
+                       str(tmp_path / "rt" / "sessions"), str(tmp_path / "proc"), NOW - 10 * (i + 1), 900 + i)
     text = ae.render_prom(ae.snapshot(make_args(tmp_path), NOW, {})[0])
-    assert 'session="same"' in text and 'session="same-2"' in text
+    assert 'session="same"' in text and 'session="same-2"' in text and 'reason="input"' in text
 
 
 def test_no_waiting_family_when_nobody_waits(tmp_path):
     fp = FakeProc(tmp_path / "proc")
     fp.add(10, [CCD], exe=CCD)
-    assert "agent_waiting_session_seconds" not in ae.render_prom(ae.snapshot(make_args(tmp_path), NOW, {})[0])
+    assert "agent_needs_you_session_seconds" not in ae.render_prom(ae.snapshot(make_args(tmp_path), NOW, {})[0])
 
 
 def test_waiting_name_falls_back_to_process_folder(tmp_path):
@@ -536,4 +540,122 @@ def test_waiting_name_falls_back_to_process_folder(tmp_path):
     (d / "old1.json").write_text(json.dumps({"session_id": "old1", "state": "waiting", "ts": NOW - 60,
                                              "pid": 10, "start": start}))
     snap, _ = ae.snapshot(make_args(tmp_path), NOW, {})
-    assert [w["name"] for w in snap["waiting"]] == ["mail-reports"]
+    assert [w["name"] for w in snap["needs_you"]] == ["mail-reports"]
+
+
+# ---------- four statuses ----------
+
+def add_claude(fp, tmp_path, pid, sid, transcript_age=None, cwd="/w/proj"):
+    fp.add(pid, [CCD], exe=CCD, age=9 * 86400, cwd=cwd)
+    fp.add(pid + 1000, ["uv"], ppid=pid, env={"CLAUDE_CODE_SESSION_ID": sid})
+    if transcript_age is not None:
+        proj = tmp_path / "claude" / "projects" / ae.project_dir_name(cwd)
+        proj.mkdir(parents=True, exist_ok=True)
+        t = proj / (sid + ".jsonl")
+        t.write_text("x")
+        os.utime(t, (NOW - transcript_age, NOW - transcript_age))
+
+
+def claude_hook(tmp_path, pid, sid, event, ts, **extra):
+    ae.record_hook({"session_id": sid, "hook_event_name": event, "cwd": "/w/proj", **extra},
+                   str(tmp_path / "rt" / "sessions"), str(tmp_path / "proc"), ts, pid)
+
+
+def test_every_session_has_exactly_one_status(tmp_path):
+    fp = FakeProc(tmp_path / "proc")
+    add_claude(fp, tmp_path, 10, "a", transcript_age=10)            # no hooks, written 10 s ago
+    add_claude(fp, tmp_path, 11, "b", transcript_age=3600)          # no hooks, an hour ago
+    add_claude(fp, tmp_path, 12, "c", transcript_age=3 * 86400)     # no hooks, 3 days ago
+    add_claude(fp, tmp_path, 13, "d", transcript_age=3600)
+    claude_hook(tmp_path, 13, "d", "Notification", NOW - 50, notification_type="agent_needs_input")
+    add_claude(fp, tmp_path, 14, "e")                               # no transcript, seen first now
+    fp.add(20, ["/usr/local/bin/codex"], age=30 * 86400)            # another agent, no hooks
+    snap, _ = ae.snapshot(make_args(tmp_path), NOW, {})
+    assert snap["status"] == {"working": 1, "needs_you": 1, "your_turn": 3, "stale": 1}
+    assert sum(snap["status"].values()) == sum(a["processes"] for a in snap["agents"].values())
+
+
+def test_question_and_plan_approval_need_you(tmp_path):
+    fp = FakeProc(tmp_path / "proc")
+    add_claude(fp, tmp_path, 10, "q", transcript_age=5)
+    claude_hook(tmp_path, 10, "q", "UserPromptSubmit", NOW - 30)
+    claude_hook(tmp_path, 10, "q", "PreToolUse", NOW - 20, tool_name="AskUserQuestion")
+    snap, _ = ae.snapshot(make_args(tmp_path), NOW, {})
+    assert [(w["name"], w["reason"]) for w in snap["needs_you"]] == [("proj", "question")]
+    claude_hook(tmp_path, 10, "q", "PostToolUse", NOW - 10, tool_name="AskUserQuestion")
+    assert ae.snapshot(make_args(tmp_path), NOW, {})[0]["status"]["working"] == 1
+    claude_hook(tmp_path, 10, "q", "PreToolUse", NOW - 5, tool_name="ExitPlanMode")
+    assert ae.snapshot(make_args(tmp_path), NOW, {})[0]["needs_you"][0]["reason"] == "plan"
+    claude_hook(tmp_path, 10, "q", "PreToolUse", NOW - 1, tool_name="Bash")  # other tools change nothing
+    assert ae.snapshot(make_args(tmp_path), NOW, {})[0]["needs_you"][0]["reason"] == "plan"
+
+
+def test_permission_request_needs_you(tmp_path):
+    fp = FakeProc(tmp_path / "proc")
+    add_claude(fp, tmp_path, 10, "p", transcript_age=5)
+    claude_hook(tmp_path, 10, "p", "PermissionRequest", NOW - 5, tool_name="Bash")
+    assert ae.snapshot(make_args(tmp_path), NOW, {})[0]["needs_you"][0]["reason"] == "permission"
+
+
+def test_interrupted_turn_falls_back_to_your_turn(tmp_path):
+    fp = FakeProc(tmp_path / "proc")
+    add_claude(fp, tmp_path, 10, "i", transcript_age=2000)
+    claude_hook(tmp_path, 10, "i", "UserPromptSubmit", NOW - 2000)  # Esc sends no Stop
+    assert ae.snapshot(make_args(tmp_path), NOW, {})[0]["status"]["your_turn"] == 1
+
+
+def test_long_tool_run_stays_working(tmp_path):
+    fp = FakeProc(tmp_path / "proc")
+    add_claude(fp, tmp_path, 10, "t", transcript_age=2000)
+    claude_hook(tmp_path, 10, "t", "PostToolUse", NOW - 2000)
+    fp.add(30, ["/usr/bin/zsh", "-c", "source /home/u/.claude/shell-snapshots/snapshot-zsh-1.sh && make test"],
+           ppid=10, age=1990)  # started after the last hook event, as a foreground tool does
+    assert ae.snapshot(make_args(tmp_path), NOW, {})[0]["status"]["working"] == 1
+
+
+def test_waiting_for_days_is_stale(tmp_path):
+    fp = FakeProc(tmp_path / "proc")
+    add_claude(fp, tmp_path, 10, "w", transcript_age=3 * 86400)
+    claude_hook(tmp_path, 10, "w", "Notification", NOW - 3 * 86400, notification_type="permission_prompt")
+    snap, _ = ae.snapshot(make_args(tmp_path), NOW, {})
+    assert snap["status"]["stale"] == 1 and snap["needs_you"] == []
+
+
+def test_agent_without_hooks_working_when_busy(tmp_path):
+    fp = FakeProc(tmp_path / "proc")
+    fp.add(20, ["/usr/local/bin/codex"], age=3600, cpu=0.0)
+    args = make_args(tmp_path)
+    _, state = ae.snapshot(args, NOW, {})
+    fp.set_ticks(20, 10 * CLK)  # 10 CPU seconds in 20 seconds
+    snap, state = ae.snapshot(args, NOW + 20, state)
+    assert snap["status"]["working"] == 1
+    snap, _ = ae.snapshot(args, NOW + 20 + 120, state)  # quiet for two minutes
+    assert snap["status"]["your_turn"] == 1
+
+
+def test_status_series_always_four(tmp_path):
+    FakeProc(tmp_path / "proc")
+    text = ae.render_prom(ae.snapshot(make_args(tmp_path), NOW, {})[0])
+    got = [l.split(" ")[0] for l in text.splitlines() if l.startswith("agent_sessions{")]
+    assert got == [f'agent_sessions{{status="{st}"}}' for st in ae.STATUSES]
+
+
+def test_install_adds_matcher_for_question_tools(tmp_path):
+    path = tmp_path / "settings.json"
+    path.write_text("{}")
+    ae.edit_settings(str(path), True, "agent-exporter hook", False)
+    pre = json.loads(path.read_text())["hooks"]["PreToolUse"]
+    assert pre[0]["matcher"] == "AskUserQuestion|ExitPlanMode"
+
+
+def test_old_background_shell_does_not_keep_a_session_working(tmp_path):
+    fp = FakeProc(tmp_path / "proc")
+    add_claude(fp, tmp_path, 10, "bg", transcript_age=20 * 3600)  # no hooks, quiet for 20 hours
+    fp.add(30, ["/usr/bin/zsh", "-c", "source /h/.claude/shell-snapshots/snapshot-zsh-1.sh && npm run dev"],
+           ppid=10, age=20 * 3600)
+    add_claude(fp, tmp_path, 11, "bg2", transcript_age=2000)
+    claude_hook(tmp_path, 11, "bg2", "PostToolUse", NOW - 2000)  # a dev server started before that event
+    fp.add(31, ["/usr/bin/zsh", "-c", "source /h/.claude/shell-snapshots/snapshot-zsh-1.sh && npm run dev"],
+           ppid=11, age=2100)
+    snap, _ = ae.snapshot(make_args(tmp_path), NOW, {})
+    assert snap["status"]["your_turn"] == 2 and snap["status"]["working"] == 0
