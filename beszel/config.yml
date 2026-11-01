@@ -1,0 +1,26 @@
+# Beszel agent config for agent-exporter. Needs Beszel with custom metrics (henrygd/beszel#2562).
+# Put this in the agent's data directory as config.yml, or point CONFIG at it.
+# Change `path` to wherever `agent-exporter run --out` writes. The Beszel agent's user must be able
+# to read that file and every directory above it.
+metrics:
+  sources:
+    - path: /home/YOU/.local/state/agent-exporter/agents.prom
+      max_age: 2m
+      display_names:
+        agent_processes_claude: Claude Code
+        agent_processes_codex: Codex
+        agent_memory_bytes_claude: Claude Code
+        agent_memory_bytes_codex: Codex
+        agent_stale_processes_claude: Claude Code
+        agent_stale_processes_codex: Codex
+        agent_stale_memory_bytes: Held by stale agents
+        agent_sessions_working: Working
+        agent_sessions_waiting: Waiting for you
+        agent_sessions_idle: Idle
+        agent_waiting_longest_seconds: Longest wait
+        agent_runaway_processes: Runaway processes
+        agent_runaway_longest_seconds: Longest runaway
+        ollama_up: ollama up
+        ollama_models_loaded: Loaded models
+        ollama_memory_bytes: ollama memory
+        ollama_vram_bytes: ollama VRAM

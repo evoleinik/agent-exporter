@@ -1,0 +1,11 @@
+[Unit]
+Description=agent-exporter: AI agent metrics for Beszel
+
+[Service]
+ExecStart=%h/.local/bin/agent-exporter run --interval 20s
+Restart=on-failure
+RestartSec=10
+Nice=10
+
+[Install]
+WantedBy=default.target

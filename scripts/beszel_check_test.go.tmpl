@@ -1,0 +1,43 @@
+package custommetrics
+
+import (
+	"os"
+	"testing"
+	"time"
+)
+
+// Copied into Beszel's custommetrics package by scripts/check-beszel.sh, then removed.
+func TestAgentExporterFile(t *testing.T) {
+	data, err := os.ReadFile("@PROM@")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fams, perrs := Parse(data)
+	for _, e := range perrs {
+		t.Errorf("parse error: %v", e)
+	}
+	for _, f := range fams {
+		if f.Type != Gauge {
+			t.Errorf("%s is not a gauge", f.Name)
+		}
+	}
+	c := NewCollector("@DATA@")
+	if c == nil {
+		t.Fatal("Beszel found no config.yml")
+	}
+	vals, meta := c.Collect(0, time.Now())
+	if len(vals) < 13 {
+		t.Errorf("Beszel collected only %d series", len(vals))
+	}
+	for k := range vals {
+		if meta[k].DisplayName == k {
+			t.Errorf("no display name for %s; add it to beszel/config.yml", k)
+		}
+	}
+	if meta["agent_memory_bytes_claude"].Unit != "bytes" {
+		t.Errorf("memory unit is %q, want bytes", meta["agent_memory_bytes_claude"].Unit)
+	}
+	if meta["agent_waiting_longest_seconds"].Unit != "seconds" {
+		t.Errorf("wait unit is %q, want seconds", meta["agent_waiting_longest_seconds"].Unit)
+	}
+}
