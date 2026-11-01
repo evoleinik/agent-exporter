@@ -1,11 +1,21 @@
 [project]
 name = "agent-exporter"
 version = "0.1.0"
-description = "AI agent metrics for a Linux box, written as a Prometheus text file for Beszel"
+description = "Which coding agents need you: Claude Code, Codex, Gemini CLI and OpenCode session states as Prometheus text for Beszel"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
 dependencies = []
+keywords = ["claude-code", "codex", "gemini-cli", "opencode", "ai-agents", "prometheus", "beszel", "monitoring"]
+classifiers = [
+    "Environment :: Console",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Topic :: System :: Monitoring",
+]
+
+[project.urls]
+Repository = "https://github.com/evoleinik/agent-exporter"
 
 [project.scripts]
 agent-exporter = "agent_exporter:main"

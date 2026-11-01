@@ -1,13 +1,39 @@
 # agent-exporter
 
-Metrics for a Linux box that runs coding agents, written as a Prometheus text file that
-[Beszel](https://github.com/henrygd/beszel) can chart. It answers four questions from the menu bar
-or a dashboard. How many agent sessions are running, and how much memory do they hold? Which ones
-have gone stale? Is any session waiting for you? Did an agent leave a process burning a CPU core?
+[![CI](https://github.com/evoleinik/agent-exporter/actions/workflows/ci.yml/badge.svg)](https://github.com/evoleinik/agent-exporter/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
+Which of your coding agents need you right now? agent-exporter watches every Claude Code, Codex,
+Gemini CLI and OpenCode session on a Linux box and sorts each one into exactly one status:
+working, needs you (a permission, a question, a plan to approve), your turn (finished, waiting for
+your next message) or stale. It writes those counts, plus memory, runaway child processes and
+ollama, as a Prometheus text file that [Beszel](https://github.com/henrygd/beszel) can chart.
+
+![The menu bar: live CPU and RAM per machine, working agents over the last hour, 1 session needs you, 18 are your turn](docs/menu-bar.png)
+
+*The menu bar view comes from the [BeszelBar agents fork](https://github.com/evoleinik/BeszelBar/tree/agents),
+drawn by its own code from sample data. N counts sessions that need you. T counts finished turns.
+W graphs working sessions, with a cyan median per 16 minutes.*
 
 It reads `/proc`, the modification dates of Claude Code transcripts, small state files written by
-agent hooks (Claude Code, Codex, Gemini CLI and OpenCode), and ollama's local API. It never opens a transcript or reads its contents.
-Python 3.10+, standard library only.
+agent hooks, and ollama's local API. It never opens a transcript or reads its contents. Python
+3.10+, standard library only.
+
+## Why
+
+Each agent vendor shows its own sessions. If you run dozens of sessions from several agents on
+one remote box, nothing tells you which one is blocked on you, which finished an hour ago, and
+which has sat untouched for a week holding a gigabyte of RAM. On the box this was built on, the
+first run found 103 of 131 Claude sessions idle for over a day, holding about 20 GB, and a test
+process an agent had left at 100% CPU for 3.5 days.
+
+## Quick start
+
+```bash
+uv tool install --editable .        # or: pipx install .
+agent-exporter install-hooks        # Claude Code; add --agent codex|gemini|opencode for the others
+agent-exporter show                 # print the snapshot; writes nothing
+```
 
 ## Metrics
 
@@ -48,7 +74,7 @@ after its parent died.
 ## Install
 
 ```bash
-uv tool install --editable ~/src/agent-exporter   # editable: the service always runs this folder's code
+uv tool install --editable .   # editable: the service always runs this folder's code
 agent-exporter install-hooks              # adds async hooks to ~/.claude/settings.json, with a backup
 agent-exporter install-hooks --agent codex      # ~/.codex/hooks.json; then trust them once in codex /hooks
 agent-exporter install-hooks --agent gemini     # ~/.gemini/settings.json
@@ -80,11 +106,14 @@ Custom metrics need Beszel with [#2562](https://github.com/henrygd/beszel/pull/2
 merged yet. Copy `beszel/config.yml` into the Beszel agent's data directory, change `path`, and make
 sure the agent's user can read the file and every directory above it.
 
-On box this runs as two user services, `beszel-hub` (bound to the Tailscale address, port 8090, served over HTTPS by `sudo tailscale serve --bg --https=10000 http://<ip>:8090`, because macOS apps refuse plain HTTP to an IP)
-and `beszel-agent`, both built from that pull request into `~/.local/bin`. Their units are in
-`beszel/systemd/`. The hub login, the agent's universal token and the hub key live in
-`~/.config/beszel/hub.env` (mode 600). The menu bar view is a private BeszelBar build,
-github.com/evoleinik/beszelbar, branch `agents`.
+Example user units for a hub and an agent built from that pull request are in `beszel/systemd/`.
+They read their login and keys from `~/.config/beszel/hub.env`, which you create with mode 600.
+macOS apps refuse plain HTTP to an IP address, so put the hub behind HTTPS (for example
+`tailscale serve`) before pointing BeszelBar at it.
+
+The menu bar client is the [BeszelBar agents fork](https://github.com/evoleinik/BeszelBar/tree/agents).
+It draws the N, T and W counts, colours each machine's RAM by memory pressure, and lists the
+sessions that need you in its dropdown.
 
 `scripts/check-beszel.sh` runs Beszel's own parser and collector from that pull request on a fresh
 file from this machine. It fails when Beszel rejects a line, a metric is not a gauge, a unit is
@@ -111,8 +140,8 @@ second source, as in `beszel/config.yml`. `tests/test_mem_pressure.py` covers bo
 | `agent-exporter show [--json]` | Print the current snapshot, with stale and runaway pids. Writes nothing. |
 | `agent-exporter collect [--out PATH or -] [--json]` | Write the file once. |
 | `agent-exporter run [--interval 20s]` | Write it on a loop. This is what the service runs. |
-| `agent-exporter hook` | Called by Claude Code hooks. Reads the event from stdin, prints nothing, always exits 0. |
-| `agent-exporter install-hooks` / `uninstall-hooks` `[--dry-run] [--json]` | Edit Claude Code settings. Only touches its own entries. |
+| `agent-exporter hook` | Called by agent hooks. Reads the event from stdin, prints nothing, always exits 0. |
+| `agent-exporter install-hooks` / `uninstall-hooks` `[--agent NAME] [--dry-run] [--json]` | Edit an agent's hook file (Claude Code by default). Only touches its own entries. |
 
 Exit codes: 0 success, 1 the file could not be written, 2 bad arguments.
 
@@ -126,6 +155,15 @@ Exit codes: 0 success, 1 the file could not be written, 2 bad arguments.
   `scripts/check-beszel.sh`. Beszel keeps 64 series per machine by default, so keep labels few.
 - Tests: `uv run --with pytest pytest -q`. They run on a fake `/proc`.
 
-## Decision record
+## Limitations
 
-Why this exists and what was ruled out: `docs/plans/2026-11-01-ai-box-agent-monitor.md`.
+- Linux only for the process scan. On macOS only `scripts/mem-pressure.sh` runs.
+- Charting needs Beszel with the unmerged custom-metrics pull request #2562.
+- Agents without hooks (aider, Cursor CLI, Goose, Amp, pi and others) get working, your turn and
+  stale from CPU use only. They never show "needs you".
+- Hook event names follow each agent's current release and can change. The tests pin the names
+  checked on 2026-11-01.
+
+## License
+
+MIT
