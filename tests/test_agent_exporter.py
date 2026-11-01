@@ -85,6 +85,9 @@ CCD = "/home/u/.claude/remote/ccd-cli/2.1.308-abc"
     (["node", "--no-warnings", "/opt/gemini.js"], "", "gemini"),
     (["python3", "-I", "/x/aider.py"], "", "aider"),
     (["codex-code-mode"], "", None),
+    (["ugrep", "-G", "x"], "/home/u/.local/share/claude/versions/2.1.300", None),
+    (["bfs", "-S", "dfs", "/"], CCD, None),
+    (["rg", "--files"], CCD, None),
     (["bash", "-c", "claude"], "/usr/bin/bash", None),
     (["node", "/srv/app/server.js"], "", None),
     ([], "", None),
@@ -414,3 +417,32 @@ def test_short_gap_between_runs_changes_nothing(tmp_path):
     assert state2["procs"]["20:" + str(int((NOW - 30 * 86400 - BTIME) * CLK))][1] is None
     snap, _ = ae.snapshot(args, NOW + 86400 + 1, state2)
     assert snap["agents"]["codex"]["stale"] == 1
+
+
+def test_claude_search_helper_can_be_a_runaway(tmp_path):
+    """Claude's find runs its own binary as bfs; a stuck one is a runaway, not a session."""
+    fp = FakeProc(tmp_path / "proc")
+    fp.add(10, [CCD], exe=CCD)
+    fp.add(11, ["/usr/bin/zsh", "-c", "find /"], ppid=10)
+    fp.add(12, ["bfs", "-S", "dfs", "/"], ppid=11, exe=CCD, age=2 * 3600, cpu=1.0)
+    snap, _ = ae.snapshot(make_args(tmp_path), NOW, {})
+    assert snap["agents"]["claude"]["processes"] == 1
+    assert [r["pid"] for r in snap["runaway"]] == [12]
+
+
+def test_runtime_dir_without_xdg_matches_service(monkeypatch, tmp_path):
+    monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+    run_user = f"/run/user/{os.getuid()}"
+    want = os.path.join(run_user, "agent-exporter") if os.path.isdir(run_user) else ae.state_home()
+    assert ae.runtime_home() == want
+
+
+def test_symlinked_settings_stay_a_symlink(tmp_path):
+    real = tmp_path / "dotfiles" / "settings.json"
+    real.parent.mkdir()
+    real.write_text("{}")
+    link = tmp_path / "settings.json"
+    link.symlink_to(real)
+    ae.edit_settings(str(link), True, "agent-exporter hook", False)
+    assert link.is_symlink()
+    assert "agent-exporter hook" in real.read_text()

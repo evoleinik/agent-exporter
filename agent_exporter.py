@@ -51,8 +51,10 @@ def state_home() -> str:
 
 
 def runtime_home() -> str:
-    base = os.environ.get("XDG_RUNTIME_DIR")
-    return os.path.join(base, "agent-exporter") if base else state_home()
+    # Hooks and the service must agree on this folder even when a session was started without
+    # XDG_RUNTIME_DIR (from cron, for example), so fall back to the standard per-user path.
+    base = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+    return os.path.join(base, "agent-exporter") if os.path.isdir(base) else state_home()
 
 
 def claude_home() -> str:
@@ -109,12 +111,15 @@ class Proc:
 
 
 def agent_name(argv: list[str], exe: str) -> str | None:
-    """Name the coding agent a process is, or None. Helpers and wrappers are not agents."""
-    for path in (exe, argv[0] if argv else ""):
-        if path and any(mark in path for mark in CLAUDE_PATHS):
-            return "claude"
+    """Name the coding agent a process is, or None. Helpers and wrappers are not agents.
+
+    Judged by argv[0], never by exe: Claude Code runs its own binary as grep, find and rg
+    (argv[0] ugrep, bfs, rg), and those must count as ordinary child processes.
+    """
     if not argv:
         return None
+    if any(mark in argv[0] for mark in CLAUDE_PATHS):
+        return "claude"
     base = os.path.basename(argv[0])
     if base in KNOWN_AGENTS:
         return base
@@ -640,7 +645,7 @@ def cmd_hook(args) -> int:
     """Called by Claude Code hooks. Prints nothing and always exits 0, so it can never block Claude."""
     now = time.time()
     try:
-        payload = json.loads(sys.stdin.read(1 << 20) or "{}")
+        payload = json.loads(sys.stdin.read() or "{}")  # PostToolUse can carry megabytes
         if isinstance(payload, dict):
             record_hook(payload, os.path.join(args.runtime_dir, "sessions"), args.proc, now, os.getppid())
     except Exception:
@@ -702,6 +707,7 @@ def edit_settings(path: str, install: bool, command: str, dry_run: bool) -> dict
     if not install and "hooks" in data and not data["hooks"]:
         data.pop("hooks")
     backup = None
+    path = os.path.realpath(path)  # keep a symlinked settings file a symlink
     if changed and not dry_run:
         if os.path.exists(path):
             backup = f"{path}.bak-agent-exporter-{time.strftime('%Y%m%d-%H%M%S')}"
