@@ -26,14 +26,17 @@ Python 3.10+, standard library only.
 Agents recognised: claude, codex, gemini, pi, opencode, aider, cursor-agent, goose, amp, qwen,
 crush, copilot. `--agents` lists the ones always reported, even at zero.
 
-How activity is judged, in order of strength:
-1. Claude Code: the transcript's last write time. The session id comes from the environment of a
-   child process (an MCP server), and the file is only `stat()`-ed.
-2. Hook events, for Claude Code sessions.
-3. CPU use between two runs above `--active-cpu` (default 0.05 cores), for every agent.
+How activity is judged:
+1. Claude Code: the transcript's last write time and the latest hook event. The session id comes
+   from the environment of a child process (an MCP server), and the file is only `stat()`-ed.
+2. Other agents, or a Claude session with neither: CPU use between two runs above `--active-cpu`
+   (default 0.05 cores). Claude's CPU is not trusted when better evidence exists, because every
+   session wakes up at once when `settings.json` changes.
+3. With no evidence at all, a process is judged from when the exporter first saw it. So a codex
+   session only becomes stale after the exporter has watched it idle for the full period.
 
-With none of these, a process is judged from when the exporter first saw it. So a codex session
-only becomes stale after the exporter has watched it idle for the full period.
+Runs less than 5 seconds apart are not compared, because tick rounding fakes CPU rates. A busy
+period ends only when CPU drops below half of `--runaway-cpu`, so a dip under load keeps it.
 
 A runaway is a non-agent process that is a descendant of an agent, or that still carries an agent's
 environment marker (`CLAUDECODE`, `AI_AGENT`, `PI_CODING_AGENT`, `CODEX_SANDBOX`, `GEMINI_CLI`)
