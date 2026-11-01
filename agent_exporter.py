@@ -222,6 +222,8 @@ def track_cpu(procs: dict[int, Proc], clk: int, prev: dict, now: float,
             p.busy_since = old[2]
         elif rate >= busy_cpu:
             p.busy_since = old[2] or prev_t
+        elif rate >= busy_cpu / 2:
+            p.busy_since = old[2]  # a dip under load does not end a busy period
         else:
             p.busy_since = None
         # Keep the old tick baseline when the gap was too short, so the next run measures a full window.
@@ -387,7 +389,10 @@ def snapshot(args, now: float, prev: dict) -> tuple[dict, dict]:
                                         "stale_memory_bytes": 0})
         a["processes"] += 1
         a["memory_bytes"] += rss
-        evidence = [t for t in (activity.get(pid), group_active.get(pid)) if t]
+        # A Claude session's transcript date and hooks are exact. Its CPU is not: every session
+        # wakes up together when settings.json changes, so CPU counts only without them.
+        exact = activity.get(pid)
+        evidence = [exact] if exact else [t for t in (group_active.get(pid),) if t]
         last = max(evidence) if evidence else p.first_seen
         idle = now - last
         if idle >= args.stale_after:

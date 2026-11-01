@@ -446,3 +446,37 @@ def test_symlinked_settings_stay_a_symlink(tmp_path):
     ae.edit_settings(str(link), True, "agent-exporter hook", False)
     assert link.is_symlink()
     assert "agent-exporter hook" in real.read_text()
+
+
+def test_claude_cpu_burst_does_not_hide_stale_session(tmp_path):
+    """Editing settings.json wakes every session at once; a 3-day-old transcript still decides."""
+    fp = FakeProc(tmp_path / "proc")
+    fp.add(10, [CCD], exe=CCD, age=9 * 86400, cwd="/p")
+    fp.add(110, ["uv"], ppid=10, env={"CLAUDE_CODE_SESSION_ID": "dddd-4444"})
+    proj = tmp_path / "claude" / "projects" / "-p"
+    proj.mkdir(parents=True)
+    t = proj / "dddd-4444.jsonl"
+    t.write_text("x")
+    os.utime(t, (NOW - 3 * 86400, NOW - 3 * 86400))
+    args = make_args(tmp_path)
+    _, state = ae.snapshot(args, NOW, {})
+    fp.set_ticks(10, 5 * CLK)  # 5 CPU seconds in 20 seconds: a reload burst
+    snap, _ = ae.snapshot(args, NOW + 20, state)
+    assert snap["agents"]["claude"]["stale"] == 1
+
+
+def test_runaway_survives_a_dip_under_load(tmp_path):
+    fp = FakeProc(tmp_path / "proc")
+    age = 2 * 86400
+    fp.add(50, ["python", "x.py"], age=age, cpu=1.0, env={"CLAUDECODE": "1"})
+    args = make_args(tmp_path)
+    _, state = ae.snapshot(args, NOW, {})
+    ticks = int(age * CLK)
+    ticks += int(0.8 * 20 * CLK)  # 0.8 cores for 20 seconds: contention, still busy
+    fp.set_ticks(50, ticks)
+    snap, state = ae.snapshot(args, NOW + 20, state)
+    assert [r["busy_seconds"] for r in snap["runaway"]] == [age + 20]
+    ticks += int(0.1 * 20 * CLK)  # 0.1 cores: it really stopped
+    fp.set_ticks(50, ticks)
+    snap, _ = ae.snapshot(args, NOW + 40, state)
+    assert snap["runaway"] == []
