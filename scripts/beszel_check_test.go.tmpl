@@ -2,6 +2,7 @@ package custommetrics
 
 import (
 	"os"
+	"strings"
 	"testing"
 	"time"
 )
@@ -29,10 +30,22 @@ func TestAgentExporterFile(t *testing.T) {
 	if len(vals) < 13 {
 		t.Errorf("Beszel collected only %d series", len(vals))
 	}
+	waiting := 0
 	for k := range vals {
+		if strings.HasPrefix(k, "agent_waiting_session_seconds_") {
+			waiting++
+			if meta[k].Unit != "seconds" {
+				t.Errorf("%s unit is %q, want seconds", k, meta[k].Unit)
+			}
+			continue // named per session, so no fixed display name
+		}
 		if meta[k].DisplayName == k {
 			t.Errorf("no display name for %s; add it to beszel/config.yml", k)
 		}
+	}
+	// BeszelBar reads the session name from this exact key shape.
+	if v, ok := vals["agent_waiting_session_seconds_beszel_check"]; !ok || v != 2700 {
+		t.Errorf("want agent_waiting_session_seconds_beszel_check = 2700, got %v (present %v, %d waiting keys)", v, ok, waiting)
 	}
 	if meta["agent_memory_bytes_claude"].Unit != "bytes" {
 		t.Errorf("memory unit is %q, want bytes", meta["agent_memory_bytes_claude"].Unit)

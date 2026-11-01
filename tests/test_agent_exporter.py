@@ -480,3 +480,49 @@ def test_runaway_survives_a_dip_under_load(tmp_path):
     fp.set_ticks(50, ticks)
     snap, _ = ae.snapshot(args, NOW + 40, state)
     assert snap["runaway"] == []
+
+
+@pytest.mark.parametrize("cwd,want", [
+    ("/home/u/src/app/.claude/worktrees/mail-reports-071777", "mail-reports"),
+    ("/home/u/src/agent-exporter/", "agent-exporter"),
+    ('/tmp/we"ird name', "we_ird_name"),
+    (None, "session-abcdef12"),
+])
+def test_session_name(cwd, want):
+    assert ae.session_name(cwd, "abcdef1234") == want
+
+
+def test_waiting_sessions_become_named_series(tmp_path):
+    fp = FakeProc(tmp_path / "proc")
+    fp.add(10, [CCD], exe=CCD)
+    fp.add(999, ["sh"], ppid=10)
+    for i in range(7):
+        cwd = "/w/mail-reports-071777" if i < 2 else f"/w/task-{i}"
+        hook(tmp_path, {"session_id": f"s{i}", "hook_event_name": "Notification", "cwd": cwd,
+                        "notification_type": "permission_prompt"}, NOW - 100 * (i + 1))
+    snap, _ = ae.snapshot(make_args(tmp_path), NOW, {})
+    assert snap["sessions"]["waiting"] == 7
+    assert [w["name"] for w in snap["waiting"]][:2] == ["task-6", "task-5"]
+    text = ae.render_prom(snap)
+    lines = [l for l in text.splitlines() if l.startswith("agent_waiting_session_seconds{")]
+    assert len(lines) == ae.MAX_WAITING_SERIES
+    assert 'agent_waiting_session_seconds{session="task-6"} 700' in lines
+    _, series = parse_prom(text)
+    assert len(series) == len(set(series))
+
+
+def test_same_folder_waiting_twice_gets_distinct_series(tmp_path):
+    fp = FakeProc(tmp_path / "proc")
+    fp.add(10, [CCD], exe=CCD)
+    fp.add(999, ["sh"], ppid=10)
+    for i in range(2):
+        hook(tmp_path, {"session_id": f"d{i}", "hook_event_name": "Notification", "cwd": "/w/same",
+                        "notification_type": "permission_prompt"}, NOW - 10 * (i + 1))
+    text = ae.render_prom(ae.snapshot(make_args(tmp_path), NOW, {})[0])
+    assert 'session="same"' in text and 'session="same-2"' in text
+
+
+def test_no_waiting_family_when_nobody_waits(tmp_path):
+    fp = FakeProc(tmp_path / "proc")
+    fp.add(10, [CCD], exe=CCD)
+    assert "agent_waiting_session_seconds" not in ae.render_prom(ae.snapshot(make_args(tmp_path), NOW, {})[0])

@@ -39,6 +39,7 @@ HOOK_EVENTS = ("SessionStart", "UserPromptSubmit", "PostToolUse", "Notification"
                "StopFailure", "SessionEnd")
 HOOK_MARK = re.compile(r"agent[-_]exporter(\.py)?['\"]? hook\b")
 SESSION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
+MAX_WAITING_SERIES = 5  # one series per waiting session; Beszel keeps 64 series per machine
 TRANSCRIPT_RETRY = 600  # seconds before searching again for a transcript that was not found
 MIN_SAMPLE = 5.0  # seconds; a shorter gap between runs turns tick rounding into fake CPU rates
 
@@ -289,6 +290,14 @@ def transcript_mtime(sid: str, cwd: str, claude_dir: str, cache: dict, now: floa
     return None
 
 
+def session_name(cwd: object, sid: str) -> str:
+    """A short, label-safe name for a session: its folder, without a worktree's hash suffix."""
+    base = os.path.basename(str(cwd).rstrip("/")) if isinstance(cwd, str) and cwd else ""
+    base = re.sub(r"-[0-9a-f]{6}$", "", base)
+    base = re.sub(r"[^A-Za-z0-9._-]", "_", base)[:48]
+    return base or "session-" + sid[:8]
+
+
 def read_hook_sessions(sessions_dir: str) -> list[dict]:
     out = []
     try:
@@ -350,6 +359,7 @@ def snapshot(args, now: float, prev: dict) -> tuple[dict, dict]:
 
     sessions = {s: 0 for s in STATES}
     waiting_longest = 0.0
+    waiting_list = []
     hook_files = read_hook_sessions(os.path.join(args.runtime_dir, "sessions"))
     stale_hook_files = []
     for h in hook_files:
@@ -365,6 +375,8 @@ def snapshot(args, now: float, prev: dict) -> tuple[dict, dict]:
         sessions[h["state"]] += 1
         if h["state"] == "waiting":
             waiting_longest = max(waiting_longest, now - h["ts"])
+            waiting_list.append({"name": h.get("name") or session_name(None, h["session_id"]),
+                                 "seconds": round(now - h["ts"]), "session_id": h["session_id"]})
 
     # A process whose parent is the same agent is part of that agent (codex's node wrapper and
     # native binary, for example). Count the topmost one; add the rest to its memory.
@@ -428,6 +440,7 @@ def snapshot(args, now: float, prev: dict) -> tuple[dict, dict]:
         "time": round(now, 3),
         "agents": agents,
         "sessions": dict(sessions, waiting_longest_seconds=round(waiting_longest)),
+        "waiting": sorted(waiting_list, key=lambda w: -w["seconds"]),
         "stale": sorted(stale, key=lambda s: -s["idle_seconds"]),
         "runaway": runaway,
         "ollama": ollama_stats(args.ollama_url, args.timeout),
@@ -464,6 +477,16 @@ def render_prom(snap: dict) -> str:
            [({"state": st}, s[st]) for st in STATES])
     family("agent_waiting_longest_seconds", "How long the longest-waiting session has waited.",
            [({}, s["waiting_longest_seconds"])])
+    shown, used = [], set()
+    for w in snap["waiting"][:MAX_WAITING_SERIES]:
+        name, n = w["name"], 2
+        while name in used:
+            name, n = f"{w['name']}-{n}", n + 1
+        used.add(name)
+        shown.append(({"session": name}, w["seconds"]))
+    if shown:
+        family("agent_waiting_session_seconds",
+               "Seconds each waiting session has waited, named by its folder. At most 5.", shown)
     family("agent_runaway_processes",
            "Processes started by agents that kept a CPU core busy past the runaway period.",
            [({}, len(snap["runaway"]))])
@@ -510,6 +533,8 @@ def render_text(snap: dict) -> str:
     if s["waiting"]:
         waiting += f" (longest {human_secs(s['waiting_longest_seconds'])})"
     out.append(f"sessions working {s['working']}  {waiting}  idle {s['idle']}  (from hooks)")
+    for w in snap["waiting"]:
+        out.append(f"waiting  {w['name']}  {human_secs(w['seconds'])}")
     if snap["runaway"]:
         for r in snap["runaway"]:
             out.append(f"runaway  pid {r['pid']} busy {human_secs(r['busy_seconds'])}  {r['cmd']}")
@@ -638,7 +663,9 @@ def record_hook(payload: dict, sessions_dir: str, proc: str, now: float, parent_
                 pass
             return
         owner = find_claude_ancestor(proc, parent_pid)
-        record = {"session_id": sid, "state": state, "ts": now, "event": event}
+        record = {"session_id": sid, "state": state, "ts": now, "event": event,
+                  "name": session_name(payload.get("cwd"), sid) if payload.get("cwd")
+                  else (old or {}).get("name") or session_name(None, sid)}
         if owner:
             record["pid"], record["start"] = owner
         elif isinstance(old, dict) and "pid" in old:
