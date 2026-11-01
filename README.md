@@ -61,7 +61,7 @@ Custom metrics need Beszel with [#2562](https://github.com/henrygd/beszel/pull/2
 merged yet. Copy `beszel/config.yml` into the Beszel agent's data directory, change `path`, and make
 sure the agent's user can read the file and every directory above it.
 
-On box this runs as two user services, `beszel-hub` (bound to the Tailscale address, port 8090)
+On box this runs as two user services, `beszel-hub` (bound to the Tailscale address, port 8090, served over HTTPS by `sudo tailscale serve --bg --https=10000 http://<ip>:8090`, because macOS apps refuse plain HTTP to an IP)
 and `beszel-agent`, both built from that pull request into `~/.local/bin`. Their units are in
 `beszel/systemd/`. The hub login, the agent's universal token and the hub key live in
 `~/.config/beszel/hub.env` (mode 600). The menu bar view is a private BeszelBar build,
