@@ -1,0 +1,15 @@
+[Unit]
+Description=Beszel agent (built from henrygd/beszel#2562, custom metrics)
+After=beszel-hub.service
+
+[Service]
+EnvironmentFile=%h/.config/beszel/hub.env
+Environment=DATA_DIR=%h/.local/share/beszel/agent
+Environment=LISTEN=127.0.0.1:45876
+Environment=SYSTEM_NAME=box
+ExecStart=%h/.local/bin/beszel-agent
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target

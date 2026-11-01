@@ -61,6 +61,12 @@ Custom metrics need Beszel with [#2562](https://github.com/henrygd/beszel/pull/2
 merged yet. Copy `beszel/config.yml` into the Beszel agent's data directory, change `path`, and make
 sure the agent's user can read the file and every directory above it.
 
+On box this runs as two user services, `beszel-hub` (bound to the Tailscale address, port 8090)
+and `beszel-agent`, both built from that pull request into `~/.local/bin`. Their units are in
+`beszel/systemd/`. The hub login, the agent's universal token and the hub key live in
+`~/.config/beszel/hub.env` (mode 600). The menu bar view is a private BeszelBar build,
+github.com/evoleinik/beszelbar, branch `agents`.
+
 `scripts/check-beszel.sh` runs Beszel's own parser and collector from that pull request on a fresh
 file from this machine. It fails when Beszel rejects a line, a metric is not a gauge, a unit is
 lost, or a series has no display name. Run it after changing the metrics.

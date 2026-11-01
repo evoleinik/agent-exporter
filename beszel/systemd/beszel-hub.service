@@ -1,0 +1,10 @@
+[Unit]
+Description=Beszel hub (built from henrygd/beszel#2562, custom metrics)
+
+[Service]
+ExecStart=%h/.local/bin/beszel serve --http YOUR_TAILSCALE_IP:8090 --dir %h/.local/share/beszel/hub
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target
