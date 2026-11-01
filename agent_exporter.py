@@ -375,7 +375,13 @@ def snapshot(args, now: float, prev: dict) -> tuple[dict, dict]:
         sessions[h["state"]] += 1
         if h["state"] == "waiting":
             waiting_longest = max(waiting_longest, now - h["ts"])
-            waiting_list.append({"name": h.get("name") or session_name(None, h["session_id"]),
+            name = h.get("name")
+            if not name and owner is not None:  # hook files written before names existed
+                try:
+                    name = session_name(os.readlink(os.path.join(args.proc, str(owner), "cwd")), h["session_id"])
+                except OSError:
+                    pass
+            waiting_list.append({"name": name or session_name(None, h["session_id"]),
                                  "seconds": round(now - h["ts"]), "session_id": h["session_id"]})
 
     # A process whose parent is the same agent is part of that agent (codex's node wrapper and

@@ -45,7 +45,7 @@ after its parent died.
 ## Install
 
 ```bash
-uv tool install ~/src/agent-exporter
+uv tool install --editable ~/src/agent-exporter   # editable: the service always runs this folder's code
 agent-exporter install-hooks              # adds async hooks to ~/.claude/settings.json, with a backup
 cp systemd/agent-exporter.service ~/.config/systemd/user/
 systemctl --user daemon-reload && systemctl --user enable --now agent-exporter

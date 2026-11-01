@@ -526,3 +526,14 @@ def test_no_waiting_family_when_nobody_waits(tmp_path):
     fp = FakeProc(tmp_path / "proc")
     fp.add(10, [CCD], exe=CCD)
     assert "agent_waiting_session_seconds" not in ae.render_prom(ae.snapshot(make_args(tmp_path), NOW, {})[0])
+
+
+def test_waiting_name_falls_back_to_process_folder(tmp_path):
+    fp = FakeProc(tmp_path / "proc")
+    start = fp.add(10, [CCD], exe=CCD, cwd="/w/mail-reports-071777")
+    d = tmp_path / "rt" / "sessions"
+    d.mkdir(parents=True)
+    (d / "old1.json").write_text(json.dumps({"session_id": "old1", "state": "waiting", "ts": NOW - 60,
+                                             "pid": 10, "start": start}))
+    snap, _ = ae.snapshot(make_args(tmp_path), NOW, {})
+    assert [w["name"] for w in snap["waiting"]] == ["mail-reports"]
