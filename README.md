@@ -71,6 +71,20 @@ github.com/evoleinik/beszelbar, branch `agents`.
 file from this machine. It fails when Beszel rejects a line, a metric is not a gauge, a unit is
 lost, or a series has no display name. Run it after changing the metrics.
 
+## Memory pressure
+
+`scripts/mem-pressure.sh OUT.prom [seconds]` writes `memory_pressure_level` every 10 seconds:
+0 normal, 1 warning, 2 critical. BeszelBar colours each machine's RAM area by it, green, yellow
+or red, as Activity Monitor does. Used RAM alone says little, because it sits near full.
+
+On Linux it reads PSI from `/proc/pressure/memory`. Warning means some task stalled on memory for
+at least 10% of the last 10 seconds. Critical means every task stalled for at least 10% of it. On
+macOS it reads the kernel's own level, `kern.memorystatus_vm_pressure_level`.
+
+Box runs it as `systemd/mem-pressure.service`. A Mac runs `launchd/dev.beszel.mem-pressure.plist`
+with the script copied to `~/.local/bin`. Add its file to the Beszel agent's `config.yml` as a
+second source, as in `beszel/config.yml`. `tests/test_mem_pressure.py` covers both mappings.
+
 ## Commands
 
 | Command | What it does |

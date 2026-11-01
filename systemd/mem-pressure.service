@@ -1,0 +1,12 @@
+[Unit]
+Description=mem-pressure: memory pressure level for Beszel
+
+[Service]
+ExecStartPre=/bin/mkdir -p %h/.local/state/mem-pressure
+ExecStart=%h/src/agent-exporter/scripts/mem-pressure.sh %h/.local/state/mem-pressure/mem.prom 10
+Restart=always
+RestartSec=10
+Nice=10
+
+[Install]
+WantedBy=default.target

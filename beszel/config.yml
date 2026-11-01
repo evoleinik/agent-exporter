@@ -1,7 +1,7 @@
 # Beszel agent config for agent-exporter. Needs Beszel with custom metrics (henrygd/beszel#2562).
 # Put this in the agent's data directory as config.yml, or point CONFIG at it.
-# Change `path` to wherever `agent-exporter run --out` writes. The Beszel agent's user must be able
-# to read that file and every directory above it.
+# Change each `path`: agent-exporter's --out file, then mem-pressure.sh's file. The Beszel agent's
+# user must be able to read each file and every directory above it.
 metrics:
   sources:
     - path: /home/YOU/.local/state/agent-exporter/agents.prom
@@ -23,3 +23,7 @@ metrics:
         ollama_models_loaded: Loaded models
         ollama_memory_bytes: ollama memory
         ollama_vram_bytes: ollama VRAM
+    - path: /home/YOU/.local/state/mem-pressure/mem.prom
+      max_age: 1m
+      display_names:
+        memory_pressure_level: Memory pressure
