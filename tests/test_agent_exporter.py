@@ -231,6 +231,33 @@ def test_hook_states_and_waiting_time(tmp_path):
     assert not (tmp_path / "rt" / "sessions" / "s1.json").exists()
 
 
+def test_plugin_hook_names_its_agent_and_is_never_credited_to_an_adopter(tmp_path):
+    """OpenCode's helper can outlive OpenCode and be adopted by a Claude session; the pid it sends wins."""
+    fp = FakeProc(tmp_path / "proc")
+    fp.add(10, [CCD], exe=CCD)                                         # the adopting Claude session
+    start = fp.add(30, ["opencode"], exe="/home/u/.opencode/bin/opencode")
+    fp.add(999, ["sh", "-c", "agent-exporter hook"], ppid=10)          # the helper, re-parented
+    ev = {"hook_event_name": "session.status", "status": "busy", "agent": "opencode"}
+    hook(tmp_path, {**ev, "session_id": "ses_live", "agent_pid": 30}, NOW - 10)
+    rec = json.load(open(tmp_path / "rt" / "sessions" / "ses_live.json"))
+    assert (rec["pid"], rec["start"]) == (30, start)
+    hook(tmp_path, {**ev, "session_id": "ses_gone", "agent_pid": 31}, NOW - 10)   # OpenCode exited
+    assert "pid" not in json.load(open(tmp_path / "rt" / "sessions" / "ses_gone.json"))
+    hook(tmp_path, {**ev, "session_id": "ses_wrong", "agent_pid": 10}, NOW - 10)  # names a Claude pid
+    assert "pid" not in json.load(open(tmp_path / "rt" / "sessions" / "ses_wrong.json"))
+
+
+def test_plugin_timestamp_orders_events_that_finish_out_of_order(tmp_path):
+    fp = FakeProc(tmp_path / "proc")
+    fp.add(30, ["opencode"], exe="/home/u/.opencode/bin/opencode")
+    ev = {"session_id": "ses_a", "hook_event_name": "session.status", "agent": "opencode", "agent_pid": 30}
+    hook(tmp_path, {**ev, "status": "idle", "ts": NOW - 5.001}, NOW)        # sent last, ran first
+    hook(tmp_path, {**ev, "status": "busy", "ts": NOW - 5.002}, NOW + 0.1)  # sent first, ran last
+    assert json.load(open(tmp_path / "rt" / "sessions" / "ses_a.json"))["state"] == "idle"
+    hook(tmp_path, {**ev, "status": "busy", "ts": NOW - 3600}, NOW + 1)     # far-off clock: ignored
+    assert json.load(open(tmp_path / "rt" / "sessions" / "ses_a.json"))["ts"] == NOW + 1
+
+
 def test_hook_out_of_order_write_is_ignored(tmp_path):
     FakeProc(tmp_path / "proc")
     hook(tmp_path, {"session_id": "s2", "hook_event_name": "Stop"}, NOW)

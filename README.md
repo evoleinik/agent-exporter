@@ -6,7 +6,7 @@ or a dashboard. How many agent sessions are running, and how much memory do they
 have gone stale? Is any session waiting for you? Did an agent leave a process burning a CPU core?
 
 It reads `/proc`, the modification dates of Claude Code transcripts, small state files written by
-Claude Code hooks, and ollama's local API. It never opens a transcript or reads its contents.
+agent hooks (Claude Code, Codex, Gemini CLI and OpenCode), and ollama's local API. It never opens a transcript or reads its contents.
 Python 3.10+, standard library only.
 
 ## Metrics
@@ -15,10 +15,11 @@ Python 3.10+, standard library only.
 |---|---|
 | `agent_processes{agent}` | Running agent sessions. A wrapper and its native binary count once. |
 | `agent_memory_bytes{agent}` | Resident memory of those processes. |
-| `agent_stale_processes{agent}` | Sessions with no activity for `--stale-after` (default 24h). |
-| `agent_stale_memory_bytes` | Memory those stale sessions hold. |
-| `agent_sessions{state}` | Claude Code sessions that are `working`, `waiting` (needs you) or `idle`, from hooks. |
-| `agent_waiting_longest_seconds` | How long the longest-waiting session has waited. |
+| `agent_sessions{status}` | Sessions that are `working`, `needs_you`, `your_turn` or `stale` (no activity for `--stale-after`, default 24h). Each session is in exactly one. |
+| `agent_stale_memory_bytes` | Memory the stale sessions hold. |
+| `agent_needs_you_session_seconds{reason,session}` | How long each session that needs you has waited, and why: permission, question, plan, input or form. At most 5. |
+| `agent_needs_you_longest_seconds` | The longest of those waits. |
+| `agent_your_turn_session_seconds{session}` | How long each finished session has waited for your next message, oldest first. At most 5. |
 | `agent_runaway_processes` | Processes an agent started that kept a core busy past `--runaway-after` (default 1h). |
 | `agent_runaway_longest_seconds` | How long the worst one has been busy. |
 | `ollama_up`, `ollama_models_loaded`, `ollama_memory_bytes`, `ollama_vram_bytes` | ollama state. |
@@ -27,9 +28,11 @@ Agents recognised: claude, codex, gemini, pi, opencode, aider, cursor-agent, goo
 crush, copilot. `--agents` lists the ones always reported, even at zero.
 
 How activity is judged:
-1. Claude Code: the transcript's last write time and the latest hook event. The session id comes
+1. Hooks, where installed: Claude Code, Codex, Gemini CLI and OpenCode tell the exporter when a
+   session starts working, needs you (a permission, a question, a plan to approve) or finishes.
+   Claude Code also gets its transcript's last write time and its own `~/.claude/sessions` record. The session id comes
    from the environment of a child process (an MCP server), and the file is only `stat()`-ed.
-2. Other agents, or a Claude session with neither: CPU use between two runs above `--active-cpu`
+2. Other agents, or a session with no hook evidence: CPU use between two runs above `--active-cpu`
    (default 0.05 cores). Claude's CPU is not trusted when better evidence exists, because every
    session wakes up at once when `settings.json` changes.
 3. With no evidence at all, a process is judged from when the exporter first saw it. So a codex
@@ -47,6 +50,9 @@ after its parent died.
 ```bash
 uv tool install --editable ~/src/agent-exporter   # editable: the service always runs this folder's code
 agent-exporter install-hooks              # adds async hooks to ~/.claude/settings.json, with a backup
+agent-exporter install-hooks --agent codex      # ~/.codex/hooks.json; then trust them once in codex /hooks
+agent-exporter install-hooks --agent gemini     # ~/.gemini/settings.json
+agent-exporter install-hooks --agent opencode   # ~/.config/opencode/plugins/agent-exporter.js
 cp systemd/agent-exporter.service ~/.config/systemd/user/
 systemctl --user daemon-reload && systemctl --user enable --now agent-exporter
 ```
@@ -54,6 +60,19 @@ systemctl --user daemon-reload && systemctl --user enable --now agent-exporter
 The service writes `~/.local/state/agent-exporter/agents.prom` every 20 seconds. Hooks and CPU
 samples live in `$XDG_RUNTIME_DIR/agent-exporter`. User services need lingering
 (`loginctl enable-linger $USER`) to run without a login session.
+
+### Hooks per agent
+
+| Agent | File | Events | Notes |
+|---|---|---|---|
+| Claude Code | `~/.claude/settings.json` | SessionStart, UserPromptSubmit, PreToolUse (AskUserQuestion, ExitPlanMode), PermissionRequest, PostToolUse, Notification, Stop, SessionEnd | Async, so Claude never waits. |
+| Codex | `~/.codex/hooks.json` | SessionStart, UserPromptSubmit, PermissionRequest, PostToolUse, Stop, SessionEnd | Codex skips async hooks, so these run in turn (about 45 ms each). A new or changed hook runs only after you trust it once in Codex's `/hooks` screen. |
+| Gemini CLI | `~/.gemini/settings.json` | SessionStart, BeforeAgent, BeforeTool (ask_user, exit_plan_mode), AfterTool, Notification (ToolPermission), AfterAgent, SessionEnd | Timeouts are in milliseconds. Hooks are on by default. |
+| OpenCode | `~/.config/opencode/plugins/agent-exporter.js` | session.status, session.idle, session.error, session.deleted, permission.asked and .replied, question.asked, .replied and .rejected | A plugin. It skips subagent sessions, and sends its own pid and a timestamp, because its helper processes can finish out of order or outlive OpenCode. |
+
+Checked against Codex 0.145, Gemini CLI 0.52 and OpenCode 1.17 on 2026-11-01: a one-line prompt
+through each produced the events above, tied to the right process. `uninstall-hooks --agent NAME`
+removes ours and leaves the rest.
 
 ## Beszel
 

@@ -2,7 +2,8 @@
 """agent-exporter: AI agent metrics for a Linux box, written as a Prometheus text file.
 
 It reads /proc, the modification dates of Claude Code transcripts (never their contents),
-small state files that Claude Code hooks write, and ollama's local API. It writes a few
+small state files that agent hooks write (Claude Code, Codex, Gemini CLI, OpenCode), and
+ollama's local API. It writes a few
 gauges that Beszel's custom metrics (henrygd/beszel#2562) can chart.
 """
 from __future__ import annotations
@@ -37,7 +38,11 @@ STATES = ("working", "waiting", "idle")  # what a hook file records
 STATUSES = ("working", "needs_you", "your_turn", "stale")
 REASONS = ("permission", "question", "plan", "input", "form")
 NOTIFICATION_REASONS = {"permission_prompt": "permission", "agent_needs_input": "input",
-                        "elicitation_dialog": "form", "elicitation_url_dialog": "form"}
+                        "elicitation_dialog": "form", "elicitation_url_dialog": "form",
+                        "ToolPermission": "permission"}  # the last one is Gemini CLI's
+# Tools that stop and wait on the person: Claude Code's, then Gemini CLI's.
+WAITING_TOOLS = {"AskUserQuestion": "question", "ExitPlanMode": "plan",
+                 "ask_user": "question", "exit_plan_mode": "plan"}
 # Claude Code hook events to install, with the matcher each needs (None = every occurrence).
 HOOK_EVENTS = {
     "SessionStart": None, "UserPromptSubmit": None,
@@ -45,6 +50,13 @@ HOOK_EVENTS = {
     "PermissionRequest": None, "PostToolUse": None, "PostToolUseFailure": None,
     "Notification": None, "Stop": None, "StopFailure": None, "SessionEnd": None,
 }
+# The other agents' hook files. Codex skips async hooks, so its hooks run in turn (they finish in
+# well under a second); Gemini CLI counts timeouts in milliseconds. OpenCode takes a plugin instead.
+CODEX_HOOK_EVENTS = {"SessionStart": None, "UserPromptSubmit": None, "PermissionRequest": None,
+                     "PostToolUse": None, "Stop": None, "SessionEnd": None}
+GEMINI_HOOK_EVENTS = {"SessionStart": None, "BeforeAgent": None, "BeforeTool": "ask_user|exit_plan_mode",
+                      "AfterTool": None, "Notification": None, "AfterAgent": None, "SessionEnd": None}
+HOOK_AGENTS = ("claude", "codex", "gemini", "opencode")
 HOOK_MARK = re.compile(r"agent[-_]exporter(\.py)?['\"]? hook\b")
 SESSION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 WORKING_TIMEOUT = 1800  # a "working" session with no sign of life this long was interrupted
@@ -70,6 +82,18 @@ def runtime_home() -> str:
 
 def claude_home() -> str:
     return os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
+
+
+def hook_file(agent: str) -> str:
+    """The file install-hooks edits for an agent."""
+    if agent == "codex":
+        return os.path.join(os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex"), "hooks.json")
+    if agent == "gemini":
+        return os.path.expanduser("~/.gemini/settings.json")
+    if agent == "opencode":
+        base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+        return os.path.join(base, "opencode", "plugins", "agent-exporter.js")
+    return os.path.join(claude_home(), "settings.json")
 
 
 def parse_duration(text: str) -> float:
@@ -703,50 +727,91 @@ def cmd_show(args) -> int:
 
 
 def hook_state(event: str, payload: dict) -> tuple[str, str | None] | None:
-    """Map a Claude Code hook event to (state, reason). None leaves the state as it was."""
-    if event in ("UserPromptSubmit", "PostToolUse", "PostToolUseFailure"):
+    """Map a hook event to (state, reason). None leaves the state as it was.
+
+    Claude Code and Codex share event names. Gemini CLI uses BeforeAgent, AfterAgent, BeforeTool
+    and AfterTool. OpenCode's plugin passes its bus events as they are (session.status and so on).
+    """
+    if event in ("UserPromptSubmit", "PostToolUse", "PostToolUseFailure", "BeforeAgent", "AfterTool",
+                 "permission.replied", "question.replied", "question.rejected"):
         return "working", None
-    if event == "PreToolUse":
-        tool = payload.get("tool_name")
-        return {"AskUserQuestion": ("waiting", "question"), "ExitPlanMode": ("waiting", "plan")}.get(tool)
-    if event == "PermissionRequest":
+    if event in ("PreToolUse", "BeforeTool"):
+        reason = WAITING_TOOLS.get(payload.get("tool_name"))
+        return ("waiting", reason) if reason else None
+    if event in ("PermissionRequest", "permission.asked"):
         return "waiting", "permission"
-    if event in ("SessionStart", "Stop", "StopFailure"):
+    if event == "question.asked":
+        return "waiting", "question"
+    if event == "session.status":
+        kind = payload.get("status")
+        return {"busy": ("working", None), "retry": ("working", None), "idle": ("idle", None)}.get(kind)
+    if event in ("SessionStart", "Stop", "StopFailure", "AfterAgent", "session.idle", "session.error"):
         return "idle", None
     if event == "Notification":
         kind = payload.get("notification_type")
         if kind in NOTIFICATION_REASONS:
             return "waiting", NOTIFICATION_REASONS[kind]
         return ("idle", None) if kind == "idle_prompt" else None
-    if event == "SessionEnd":
+    if event in ("SessionEnd", "session.deleted"):
         return "ended", None
     return None
+
+
+def read_agent(proc: str, pid: int) -> tuple[str | None, int, int] | None:
+    """(agent name or None, parent pid, start ticks) for a live process, or None."""
+    d = os.path.join(proc, str(pid))
+    try:
+        with open(os.path.join(d, "stat")) as f:
+            stat = f.read()
+        with open(os.path.join(d, "cmdline"), "rb") as f:
+            argv = [a.decode(errors="replace") for a in f.read().split(b"\0") if a]
+        try:
+            exe = os.readlink(os.path.join(d, "exe"))
+        except OSError:
+            exe = ""
+    except OSError:
+        return None
+    fields = stat[stat.rfind(")") + 2:].split()
+    return agent_name(argv, exe), int(fields[1]), int(fields[19])
 
 
 def find_agent_ancestor(proc: str, start_pid: int) -> tuple[int, int] | None:
     """The nearest ancestor that is a coding agent: (pid, start ticks)."""
     pid, hops = start_pid, 0
     while pid > 1 and hops < 16:
-        d = os.path.join(proc, str(pid))
-        try:
-            with open(os.path.join(d, "stat")) as f:
-                stat = f.read()
-            with open(os.path.join(d, "cmdline"), "rb") as f:
-                argv = [a.decode(errors="replace") for a in f.read().split(b"\0") if a]
-            try:
-                exe = os.readlink(os.path.join(d, "exe"))
-            except OSError:
-                exe = ""
-        except OSError:
+        found = read_agent(proc, pid)
+        if found is None:
             return None
-        fields = stat[stat.rfind(")") + 2:].split()
-        if agent_name(argv, exe):
-            return pid, int(fields[19])
-        pid, hops = int(fields[1]), hops + 1
+        name, ppid, start = found
+        if name:
+            return pid, start
+        pid, hops = ppid, hops + 1
     return None
 
 
+def hook_owner(payload: dict, proc: str, parent_pid: int) -> tuple[int, int] | None:
+    """The agent process a hook event belongs to: (pid, start ticks).
+
+    A plugin that runs inside the agent (OpenCode's) names its own pid, because its helper can
+    outlive the agent and be adopted by an unrelated process, such as a Claude session, so walking
+    up from it would credit the wrong agent. Hooks the agent waits on walk up to it."""
+    pid = payload.get("agent_pid")
+    if pid is None:
+        return find_agent_ancestor(proc, parent_pid)
+    if not isinstance(pid, int) or isinstance(pid, bool):
+        return None
+    found = read_agent(proc, pid)
+    if found is None or found[0] is None or found[0] != payload.get("agent", found[0]):
+        return None
+    return pid, found[2]
+
+
 def record_hook(payload: dict, sessions_dir: str, proc: str, now: float, parent_pid: int) -> None:
+    # A plugin's own timestamp orders its events better than when each helper got to run; trust it
+    # only when it is close to now.
+    sent = payload.get("ts")
+    if isinstance(sent, (int, float)) and not isinstance(sent, bool) and abs(sent - now) < 60:
+        now = float(sent)
     sid = payload.get("session_id")
     event = payload.get("hook_event_name")
     if not isinstance(sid, str) or not SESSION_ID.fullmatch(sid) or not isinstance(event, str):
@@ -768,7 +833,7 @@ def record_hook(payload: dict, sessions_dir: str, proc: str, now: float, parent_
             except OSError:
                 pass
             return
-        owner = find_agent_ancestor(proc, parent_pid)
+        owner = hook_owner(payload, proc, parent_pid)
         record = {"session_id": sid, "state": state, "ts": now, "event": event, "reason": reason,
                   "notification_type": payload.get("notification_type"),
                   "name": session_name(payload.get("cwd"), sid) if payload.get("cwd")
@@ -781,7 +846,7 @@ def record_hook(payload: dict, sessions_dir: str, proc: str, now: float, parent_
 
 
 def cmd_hook(args) -> int:
-    """Called by Claude Code hooks. Prints nothing and always exits 0, so it can never block Claude."""
+    """Called by agent hooks. Prints nothing and always exits 0, so it can never block an agent."""
     now = time.time()
     try:
         payload = json.loads(sys.stdin.read() or "{}")  # PostToolUse can carry megabytes
@@ -803,7 +868,11 @@ def is_ours(handler: dict) -> bool:
     return isinstance(handler, dict) and bool(HOOK_MARK.search(str(handler.get("command", ""))))
 
 
-def edit_settings(path: str, install: bool, command: str, dry_run: bool) -> dict:
+def edit_settings(path: str, install: bool, command: str, dry_run: bool,
+                  events: dict = HOOK_EVENTS, handler: dict | None = None) -> dict:
+    """Add or remove our hooks in a Claude-style settings file: Claude Code's settings.json,
+    Codex's hooks.json or Gemini CLI's settings.json. `handler` holds the extra handler fields."""
+    handler = {"async": True, "timeout": 10} if handler is None else handler
     if os.path.exists(path):
         try:
             with open(path) as f:
@@ -816,14 +885,14 @@ def edit_settings(path: str, install: bool, command: str, dry_run: bool) -> dict
         data = {}
     hooks = data.setdefault("hooks", {}) if install else data.get("hooks") or {}
     changed, unchanged = [], []
-    for event, matcher in HOOK_EVENTS.items():
+    for event, matcher in events.items():
         groups = hooks.get(event) or []
         ours = any(is_ours(h) for g in groups if isinstance(g, dict) for h in g.get("hooks") or [])
         if install:
             if ours:
                 unchanged.append(event)
                 continue
-            group = {"hooks": [{"type": "command", "command": command, "async": True, "timeout": 10}]}
+            group = {"hooks": [{"type": "command", "command": command, **handler}]}
             if matcher:
                 group = {"matcher": matcher, **group}
             groups.append(group)
@@ -858,9 +927,84 @@ def edit_settings(path: str, install: bool, command: str, dry_run: bool) -> dict
             "backup": backup, "command": command if install else None}
 
 
+OPENCODE_PLUGIN = """// agent-exporter: tells agent-exporter when an OpenCode session is working, needs you or is idle.
+// Written by `agent-exporter install-hooks --agent opencode`; removed by uninstall-hooks.
+import { spawn } from "node:child_process"
+
+const COMMAND = __COMMAND__
+// Each event carries the time OpenCode saw it, because the helpers it starts can finish out of order.
+// Events that change a session's status. Child sessions (subagents) are skipped, so a finished
+// subagent never makes the main session look idle.
+const EVENTS = new Set(["session.status", "session.idle", "session.error", "session.deleted",
+  "permission.asked", "permission.replied", "question.asked", "question.replied", "question.rejected"])
+
+export const AgentExporter = async ({ directory }) => {
+  const children = new Set()
+  const send = (payload) => {
+    try {
+      const child = spawn(COMMAND, { shell: true, stdio: ["pipe", "ignore", "ignore"] })
+      child.on("error", () => {})
+      child.stdin.on("error", () => {})
+      child.stdin.end(JSON.stringify(payload))
+    } catch {}
+  }
+  return {
+    event: async ({ event }) => {
+      const p = event.properties || {}
+      if (event.type === "session.created" || event.type === "session.updated") {
+        if (p.info && p.info.parentID) children.add(p.info.id)
+        return
+      }
+      if (!EVENTS.has(event.type)) return
+      const sid = p.sessionID || (p.info && p.info.id)
+      if (!sid || children.has(sid)) return
+      send({ session_id: sid, hook_event_name: event.type, cwd: directory,
+             status: p.status && p.status.type, agent: "opencode", agent_pid: process.pid,
+             ts: (performance.timeOrigin + performance.now()) / 1000 })
+    },
+  }
+}
+"""
+
+
+def edit_plugin(path: str, install: bool, command: str, dry_run: bool) -> dict:
+    """Write or remove the OpenCode plugin. A file without our first line is never touched."""
+    text = OPENCODE_PLUGIN.replace("__COMMAND__", json.dumps(command))
+    mark = OPENCODE_PLUGIN.splitlines()[0]
+    try:
+        with open(path) as f:
+            current = f.read()
+    except OSError:
+        current = None
+    if current is not None and not current.startswith(mark):
+        raise SystemExit(f"agent-exporter: {path} exists and is not ours; not touching it")
+    changed = (current != text) if install else current is not None
+    if changed and not dry_run:
+        if install:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            write_atomic(path, text)
+        else:
+            os.unlink(path)
+    return {"settings": path, "changed": ["plugin"] if changed else [],
+            "unchanged": [] if changed or not install else ["plugin"], "dry_run": dry_run,
+            "backup": None, "command": command if install else None}
+
+
 def cmd_hooks(args) -> int:
     install = args.command == "install-hooks"
-    receipt = edit_settings(args.settings, install, args.hook_command or hook_command(), args.dry_run)
+    path = args.settings or hook_file(args.agent)
+    command = args.hook_command or hook_command()
+    if args.agent == "opencode":
+        receipt = edit_plugin(path, install, command, args.dry_run)
+    else:
+        events, handler = {"claude": (HOOK_EVENTS, None), "codex": (CODEX_HOOK_EVENTS, {"timeout": 10}),
+                           "gemini": (GEMINI_HOOK_EVENTS, {"timeout": 10000})}[args.agent]
+        receipt = edit_settings(path, install, command, args.dry_run, events, handler)
+    receipt["agent"] = args.agent
+    # Codex runs a new or changed hook only after the person trusts it once in its /hooks screen.
+    if args.agent == "codex" and install and receipt["changed"]:
+        receipt["next"] = "open codex, run /hooks and trust the agent-exporter hooks"
+    args.settings = path
     if args.json:
         print(json.dumps(receipt))
     else:
@@ -870,6 +1014,8 @@ def cmd_hooks(args) -> int:
                   + (f" (backup {receipt['backup']})" if receipt["backup"] else ""))
         else:
             print(f"nothing to change in {args.settings}")
+        if receipt.get("next"):
+            print(f"next: {receipt['next']}")
     return 0
 
 
@@ -914,12 +1060,14 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--interval", type=parse_duration, default=parse_duration("20s"),
                    help="time between writes (default: 20s)")
     sub.add_parser("show", parents=[collect], help="print the current snapshot, write nothing")
-    sub.add_parser("hook", parents=[common], help="record a Claude Code hook event from stdin")
-    for name, text in (("install-hooks", "add the hooks to Claude Code settings"),
-                       ("uninstall-hooks", "remove the hooks from Claude Code settings")):
+    sub.add_parser("hook", parents=[common], help="record an agent's hook event from stdin")
+    for name, text in (("install-hooks", "add the hooks to an agent's settings"),
+                       ("uninstall-hooks", "remove the hooks from an agent's settings")):
         h = sub.add_parser(name, help=text)
-        h.add_argument("--settings", default=os.path.join(claude_home(), "settings.json"),
-                       help="settings file to edit (default: %(default)s)")
+        h.add_argument("--agent", choices=HOOK_AGENTS, default="claude",
+                       help="which agent (default: %(default)s)")
+        h.add_argument("--settings",
+                       help="file to edit (default: the agent's own, such as ~/.codex/hooks.json)")
         h.add_argument("--hook-command", help="command the hooks run (default: this program + hook)")
         h.add_argument("--dry-run", action="store_true", help="report the change, write nothing")
         h.add_argument("--json", action="store_true", help="print the receipt as JSON")
