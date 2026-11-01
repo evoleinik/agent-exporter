@@ -40,6 +40,7 @@ HOOK_EVENTS = ("SessionStart", "UserPromptSubmit", "PostToolUse", "Notification"
 HOOK_MARK = re.compile(r"agent[-_]exporter(\.py)?['\"]? hook\b")
 SESSION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 TRANSCRIPT_RETRY = 600  # seconds before searching again for a transcript that was not found
+MIN_SAMPLE = 5.0  # seconds; a shorter gap between runs turns tick rounding into fake CPU rates
 
 
 # ---------- paths ----------
@@ -204,7 +205,7 @@ def track_cpu(procs: dict[int, Proc], clk: int, prev: dict, now: float,
     tracked = {}
     for p in procs.values():
         old = prev_procs.get(p.key)
-        rate = (p.ticks - old[0]) / clk / dt if old and dt and dt > 0 else None
+        rate = (p.ticks - old[0]) / clk / dt if old and dt and dt >= MIN_SAMPLE else None
         p.first_seen = old[3] if old else now
         p.last_active = old[1] if old else None
         if rate is not None and rate >= active_cpu:
@@ -218,7 +219,9 @@ def track_cpu(procs: dict[int, Proc], clk: int, prev: dict, now: float,
             p.busy_since = old[2] or prev_t
         else:
             p.busy_since = None
-        tracked[p.key] = [p.ticks, p.last_active, p.busy_since, p.first_seen]
+        # Keep the old tick baseline when the gap was too short, so the next run measures a full window.
+        base = old[0] if old and rate is None and dt is not None and dt < MIN_SAMPLE else p.ticks
+        tracked[p.key] = [base, p.last_active, p.busy_since, p.first_seen]
     return tracked
 
 
@@ -525,7 +528,8 @@ def run_collect(args) -> int:
         sys.stdout.write(text)
     else:
         write_atomic(args.out, text)
-    write_atomic(state_path, json.dumps(state, separators=(",", ":")))
+    if not prev.get("t") or now - prev["t"] >= MIN_SAMPLE:
+        write_atomic(state_path, json.dumps(state, separators=(",", ":")))
     for path in snap["_stale_hook_files"]:
         try:
             if now - os.stat(path).st_mtime > 3600:

@@ -397,3 +397,20 @@ def test_hook_mark_matches_both_launch_forms():
     assert ae.is_ours({"command": "/home/u/.local/bin/agent-exporter hook"})
     assert ae.is_ours({"command": "/usr/bin/python3 /src/agent_exporter.py hook"})
     assert not ae.is_ours({"command": "my-agent-exporter-wrapper hookup"})
+
+
+def test_short_gap_between_runs_changes_nothing(tmp_path):
+    """A manual run a second after the service must not read tick rounding as activity or idleness."""
+    fp = FakeProc(tmp_path / "proc")
+    fp.add(20, ["/usr/local/bin/codex"], age=30 * 86400, cpu=0.0)
+    fp.add(50, ["python", "x.py"], age=2 * 86400, cpu=1.0, env={"CLAUDECODE": "1"})
+    args = make_args(tmp_path)
+    _, state = ae.snapshot(args, NOW, {})
+    busy_ticks = int(1.0 * 2 * 86400 * CLK)
+    fp.set_ticks(20, 1)            # one stray tick in half a second looks like 0.02 to 0.2 cores
+    fp.set_ticks(50, busy_ticks)   # no ticks counted yet in half a second looks idle
+    snap, state2 = ae.snapshot(args, NOW + 0.5, state)
+    assert [r["pid"] for r in snap["runaway"]] == [50]
+    assert state2["procs"]["20:" + str(int((NOW - 30 * 86400 - BTIME) * CLK))][1] is None
+    snap, _ = ae.snapshot(args, NOW + 86400 + 1, state2)
+    assert snap["agents"]["codex"]["stale"] == 1
