@@ -486,7 +486,8 @@ def test_runaway_survives_a_dip_under_load(tmp_path):
 @pytest.mark.parametrize("cwd,want", [
     ("/home/u/src/app/.claude/worktrees/mail-reports-071777", "mail-reports"),
     ("/home/u/src/agent-exporter/", "agent-exporter"),
-    ('/tmp/we"ird name', "we_ird_name"),
+    ('/tmp/we"ird name', "we-ird-name"),
+    ("Research: why Gemini writes good Russian", "Research-why-Gemini-writes-good-Russian"),
     (None, "session-abcdef12"),
 ])
 def test_session_name(cwd, want):
@@ -659,3 +660,57 @@ def test_old_background_shell_does_not_keep_a_session_working(tmp_path):
            ppid=11, age=2100)
     snap, _ = ae.snapshot(make_args(tmp_path), NOW, {})
     assert snap["status"]["your_turn"] == 2 and snap["status"]["working"] == 0
+
+
+def write_claude_status(tmp_path, pid, start, status, updated, name=None, sid="sx"):
+    d = tmp_path / "claude" / "sessions"
+    d.mkdir(parents=True, exist_ok=True)
+    rec = {"pid": pid, "procStart": str(start), "sessionId": sid, "status": status,
+           "statusUpdatedAt": int(updated * 1000)}
+    if name:
+        rec["name"] = name
+    (d / f"{pid}.json").write_text(json.dumps(rec))
+
+
+def test_claude_status_file_is_the_authority(tmp_path):
+    fp = FakeProc(tmp_path / "proc")
+    starts = {}
+    for pid, sid in ((10, "a"), (11, "b"), (12, "c"), (13, "d")):
+        fp.add(pid, [CCD], exe=CCD, age=9 * 86400, cwd="/w/proj")
+        starts[pid] = int((NOW - 9 * 86400 - BTIME) * CLK)
+    write_claude_status(tmp_path, 10, starts[10], "busy", NOW - 5)
+    write_claude_status(tmp_path, 11, starts[11], "waiting", NOW - 300, name="Fix the login bug")
+    write_claude_status(tmp_path, 12, starts[12], "idle", NOW - 3600)
+    write_claude_status(tmp_path, 13, starts[13], "idle", NOW - 3 * 86400)
+    snap, _ = ae.snapshot(make_args(tmp_path), NOW, {})
+    assert snap["status"] == {"working": 1, "needs_you": 1, "your_turn": 1, "stale": 1}
+    assert [(w["name"], w["seconds"]) for w in snap["needs_you"]] == [("Fix-the-login-bug", 300)]
+
+
+def test_claude_status_from_another_process_is_ignored(tmp_path):
+    fp = FakeProc(tmp_path / "proc")
+    fp.add(10, [CCD], exe=CCD, age=9 * 86400, cwd="/w/proj")
+    write_claude_status(tmp_path, 10, 12345, "busy", NOW - 5)  # pid reused by a new process
+    snap, _ = ae.snapshot(make_args(tmp_path), NOW, {})
+    assert snap["status"]["working"] == 0
+
+
+def test_question_hook_beats_busy_status(tmp_path):
+    fp = FakeProc(tmp_path / "proc")
+    fp.add(10, [CCD], exe=CCD, age=9 * 86400, cwd="/w/proj")
+    fp.add(999, ["sh"], ppid=10)
+    write_claude_status(tmp_path, 10, int((NOW - 9 * 86400 - BTIME) * CLK), "busy", NOW - 20)
+    claude_hook(tmp_path, 999, "q", "PreToolUse", NOW - 10, tool_name="AskUserQuestion")
+    snap, _ = ae.snapshot(make_args(tmp_path), NOW, {})
+    assert [w["reason"] for w in snap["needs_you"]] == ["question"]
+
+
+def test_your_turn_series_oldest_first(tmp_path):
+    fp = FakeProc(tmp_path / "proc")
+    for i, age in enumerate((600, 7200, 3600)):
+        pid = 10 + i
+        fp.add(pid, [CCD], exe=CCD, age=9 * 86400, cwd=f"/w/t{i}")
+        write_claude_status(tmp_path, pid, int((NOW - 9 * 86400 - BTIME) * CLK), "idle", NOW - age, name=f"task {i}")
+    snap, _ = ae.snapshot(make_args(tmp_path), NOW, {})
+    assert [w["name"] for w in snap["your_turn"]] == ["task-1", "task-2", "task-0"]
+    assert 'agent_your_turn_session_seconds{session="task-1"} 7200' in ae.render_prom(snap)

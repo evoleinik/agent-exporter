@@ -32,6 +32,9 @@ func TestAgentExporterFile(t *testing.T) {
 	}
 	waiting := 0
 	for k := range vals {
+		if strings.HasPrefix(k, "agent_your_turn_session_seconds_") {
+			continue // named per session, so no fixed display name
+		}
 		if strings.HasPrefix(k, "agent_needs_you_session_seconds_") {
 			waiting++
 			if meta[k].Unit != "seconds" {

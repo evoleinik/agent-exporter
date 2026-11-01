@@ -304,8 +304,26 @@ def session_name(cwd: object, sid: str) -> str:
     """A short, label-safe name for a session: its folder, without a worktree's hash suffix."""
     base = os.path.basename(str(cwd).rstrip("/")) if isinstance(cwd, str) and cwd else ""
     base = re.sub(r"-[0-9a-f]{6}$", "", base)
-    base = re.sub(r"[^A-Za-z0-9._-]", "_", base)[:48]
+    base = re.sub(r"[^A-Za-z0-9._]+", "-", base).strip("-")[:48].rstrip("-")
     return base or "session-" + sid[:8]
+
+
+def read_claude_status(claude_dir: str) -> dict[int, dict]:
+    """Claude Code's own per-process status files (~/.claude/sessions/<pid>.json): status busy,
+    waiting or idle, statusUpdatedAt in ms, the session title and the process start ticks.
+    Undocumented, so callers fall back to hooks and transcript dates when a field is missing."""
+    out = {}
+    try:
+        names = os.listdir(os.path.join(claude_dir, "sessions"))
+    except OSError:
+        return out
+    for name in names:
+        if not name.endswith(".json") or not name[:-5].isdigit():
+            continue
+        data = load_json(os.path.join(claude_dir, "sessions", name))
+        if isinstance(data, dict) and isinstance(data.get("pid"), int):
+            out[data["pid"]] = data
+    return out
 
 
 def read_hook_sessions(sessions_dir: str) -> list[dict]:
@@ -419,10 +437,13 @@ def snapshot(args, now: float, prev: dict) -> tuple[dict, dict]:
             stack.extend(kids.get(q.pid, []))
         return False
 
+    claude_status = read_claude_status(args.claude_dir)
+    CLAUDE_STATES = {"busy": "working", "waiting": "waiting", "idle": "idle"}
+
     agents = {name: {"processes": 0, "memory_bytes": 0, "stale": 0, "stale_memory_bytes": 0}
               for name in args.agents}
     status = {k: 0 for k in STATUSES}
-    needs_you, stale, sessions_out = [], [], []
+    needs_you, your_turn, stale, sessions_out = [], [], [], []
     for pid, rss in group_rss.items():
         p = procs[pid]
         a = agents.setdefault(p.agent, {"processes": 0, "memory_bytes": 0, "stale": 0,
@@ -430,6 +451,18 @@ def snapshot(args, now: float, prev: dict) -> tuple[dict, dict]:
         a["processes"] += 1
         a["memory_bytes"] += rss
         h = hooks.get(pid)
+        own = claude_status.get(pid) if p.agent == "claude" else None
+        if own and str(own.get("procStart")) != str(p.start_ticks):
+            own = None  # a reused pid
+        if own and own.get("status") in CLAUDE_STATES and isinstance(own.get("statusUpdatedAt"), (int, float)):
+            own_ts = own["statusUpdatedAt"] / 1000
+            hook_says_question = (h and h["state"] == "waiting" and h.get("reason") in ("question", "plan", "permission")
+                                  and h["ts"] >= own_ts - 1)
+            if not hook_says_question:
+                # Claude's own record is the authority; the hook only adds a reason.
+                reason = h.get("reason") if h and h["state"] == "waiting" else None
+                h = {"state": CLAUDE_STATES[own["status"]], "ts": own_ts, "reason": reason,
+                     "name": (h or {}).get("name"), "session_id": own.get("sessionId")}
         # Transcript dates and hook events are exact. CPU is not: every Claude session wakes up at
         # once when settings.json changes, so CPU counts only when nothing exact exists.
         exact = max([t for t in (activity.get(pid), h["ts"] if h else None) if t], default=None)
@@ -453,12 +486,17 @@ def snapshot(args, now: float, prev: dict) -> tuple[dict, dict]:
             cwd = os.readlink(os.path.join(args.proc, str(pid), "cwd"))
         except OSError:
             cwd = ""
-        name = (h or {}).get("name") or session_name(cwd, sids.get(pid) or str(pid))
+        title = (own or {}).get("name") if own else None
+        name = (session_name(title, "") if isinstance(title, str) and title.strip() else None) \
+            or (h or {}).get("name") or session_name(cwd, sids.get(pid) or str(pid))
         sessions_out.append({"pid": pid, "agent": p.agent, "status": st, "name": name,
                              "idle_seconds": round(idle), "memory_bytes": rss})
         if st == "needs_you":
             needs_you.append({"name": name, "reason": h.get("reason") or "input", "agent": p.agent,
                               "seconds": round(now - h["ts"]), "session_id": h.get("session_id")})
+        elif st == "your_turn":
+            your_turn.append({"name": name, "agent": p.agent, "seconds": round(idle),
+                              "session_id": (h or {}).get("session_id") or sids.get(pid)})
         elif st == "stale":
             a["stale"] += 1
             a["stale_memory_bytes"] += rss
@@ -493,6 +531,7 @@ def snapshot(args, now: float, prev: dict) -> tuple[dict, dict]:
         "agents": agents,
         "status": status,
         "needs_you": sorted(needs_you, key=lambda w: -w["seconds"]),
+        "your_turn": sorted(your_turn, key=lambda w: -w["seconds"]),
         "sessions": sorted(sessions_out, key=lambda x: (STATUSES.index(x["status"]), x["idle_seconds"])),
         "stale": sorted(stale, key=lambda s: -s["idle_seconds"]),
         "runaway": runaway,
@@ -538,6 +577,16 @@ def render_prom(snap: dict) -> str:
     if shown:
         family("agent_needs_you_session_seconds",
                "Seconds each session has needed you, by reason and folder name. At most 5.", shown)
+    shown, used = [], set()
+    for w in snap["your_turn"][:MAX_WAITING_SERIES]:
+        name, n = w["name"], 2
+        while name in used:
+            name, n = f"{w['name']}-{n}", n + 1
+        used.add(name)
+        shown.append(({"session": name}, w["seconds"]))
+    if shown:
+        family("agent_your_turn_session_seconds",
+               "Seconds since each your-turn session last did anything, oldest first, by name. At most 5.", shown)
     family("agent_runaway_processes",
            "Processes started by agents that kept a CPU core busy past the runaway period.",
            [({}, len(snap["runaway"]))])
