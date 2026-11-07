@@ -74,6 +74,26 @@ def test_gemini_hooks_keep_settings_and_use_milliseconds(tmp_path):
     assert json.loads(path.read_text()) == {"security": {"auth": {"selectedType": "vertex-ai"}}}
 
 
+@pytest.mark.parametrize("agent", ["claude", "codex", "gemini"])
+def test_hooks_keep_a_private_settings_file_private(tmp_path, agent):
+    # Issue #1: the rewrite used to come back 0644 whatever the file's mode was.
+    path = tmp_path / "settings.json"
+    path.write_text("{}\n")
+    path.chmod(0o600)
+    for cmd in ("install-hooks", "uninstall-hooks"):
+        run_cli(cmd, "--agent", agent, "--settings", str(path), "--hook-command", "/x/agent-exporter hook", "--json")
+        assert path.stat().st_mode & 0o777 == 0o600, cmd
+
+
+def test_write_atomic_new_file_gets_the_umask_default(tmp_path):
+    old = os.umask(0o022)
+    try:
+        ae.write_atomic(str(tmp_path / "new.json"), "{}\n")
+    finally:
+        os.umask(old)
+    assert (tmp_path / "new.json").stat().st_mode & 0o777 == 0o644
+
+
 def test_opencode_plugin_install_is_idempotent_and_never_overwrites_a_foreign_file(tmp_path):
     path = tmp_path / "plugins" / "agent-exporter.js"
     r = ae.edit_plugin(str(path), True, "/x/agent-exporter hook", False)

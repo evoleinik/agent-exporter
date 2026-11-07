@@ -125,11 +125,22 @@ def load_json(path: str):
 
 
 def write_atomic(path: str, text: str) -> None:
-    """Write via a temp name that does not end in .prom, then rename (Beszel #2562 contract)."""
+    """Write via a temp name that does not end in .prom, then rename (Beszel #2562 contract).
+
+    A file that already exists keeps its mode, so a chmod 600 settings file stays private (#1).
+    The temp file is made private before any text goes in. A new file gets the umask default.
+    """
     folder = os.path.dirname(os.path.abspath(path))
     os.makedirs(folder, exist_ok=True)
     tmp = os.path.join(folder, "." + os.path.basename(path) + ".tmp")
-    with open(tmp, "w") as f:
+    try:
+        mode = os.stat(path).st_mode & 0o7777
+    except FileNotFoundError:
+        mode = None
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o666 if mode is None else 0o600)
+    with os.fdopen(fd, "w") as f:
+        if mode is not None:
+            os.fchmod(f.fileno(), mode)
         f.write(text)
     os.replace(tmp, path)
 
